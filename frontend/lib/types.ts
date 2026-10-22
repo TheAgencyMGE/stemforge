@@ -1,0 +1,181 @@
+// Mirrors backend/stemforge/schemas.py (the OpenAPI contract at /api/openapi.json).
+
+export interface Note {
+  id: string;
+  pitch: number;
+  start: number; // seconds, relative to the processed region
+  end: number;
+  velocity: number;
+  /** Model confidence 0..1, or null for notes the user drew. */
+  confidence: number | null;
+  /** [seconds from note start, semitones] */
+  bends: [number, number][] | null;
+}
+
+export interface NotesDoc {
+  version: number;
+  notes: Note[];
+}
+
+export interface Artifact {
+  id: string;
+  kind: "master" | "preview" | "stem" | "peaks" | "spectrogram" | "midi" | "midi_combined";
+  stem: string | null;
+  filename: string;
+  content_type: string;
+  size: number;
+  url: string;
+  meta: Record<string, unknown>;
+}
+
+export interface TrackStats {
+  rms_db: number;
+  peak_db: number;
+  clipped_ratio: number;
+  relative_db?: number;
+  silent?: boolean;
+  mix_residual_db?: number;
+}
+
+export interface Track {
+  id: string;
+  stem: string;
+  display_name: string;
+  order_index: number;
+  source_model: string;
+  is_drum: boolean;
+  gm_program: number;
+  stats: TrackStats;
+  warnings: string[];
+  engine: EngineId | null;
+  engine_reason: string | null;
+  engine_params: Record<string, number | null>;
+  notes_version: number;
+  note_count: number;
+  edited: boolean;
+  transcription_status: "pending" | "done" | "skipped" | "failed";
+  transcription_summary: {
+    count?: number;
+    mean_confidence?: number | null;
+    low_confidence?: number;
+    pitch_range?: [number, number];
+    detail?: string;
+  } | null;
+}
+
+export interface StageState {
+  status: "running" | "done" | "skipped" | "failed";
+  progress: number;
+  message?: string;
+  seconds?: number;
+  [k: string]: unknown;
+}
+
+export interface Job {
+  id: string;
+  project_id: string;
+  kind: "process" | "retranscribe";
+  status: "queued" | "running" | "succeeded" | "failed" | "cancelled";
+  stage: string | null;
+  progress: number;
+  eta_seconds: number | null;
+  stages: Record<string, StageState>;
+  stage_order: string[];
+  message: string | null;
+  error: string | null;
+  attempts: number;
+  max_attempts: number;
+  params: Record<string, unknown>;
+  created_at: string;
+  started_at: string | null;
+  finished_at: string | null;
+}
+
+export interface KeyInfo {
+  tonic: string;
+  tonic_pc: number;
+  mode: "major" | "minor";
+  label: string;
+  correlation: number;
+  margin: number;
+  runner_up: string;
+}
+
+export interface Analysis {
+  duration: number;
+  sample_rate: number;
+  rms_db: number;
+  peak_db: number;
+  clipped_ratio: number;
+  tempo: number | null;
+  tempo_confidence?: number;
+  beats: number[];
+  first_beat?: number;
+  key: KeyInfo | null;
+  sections: { start: number; end: number; label: string }[];
+  silent: boolean;
+}
+
+export interface ProjectSummary {
+  id: string;
+  name: string;
+  status: "queued" | "processing" | "ready" | "failed" | "cancelled";
+  original_filename: string;
+  duration: number | null;
+  tempo: number | null;
+  key: string | null;
+  stems: number;
+  is_sample: boolean;
+  error: string | null;
+  created_at: string;
+  expires_at: string | null;
+}
+
+export interface ProjectDetail extends ProjectSummary {
+  options: {
+    six_stem?: boolean;
+    trim_start?: number;
+    trim_end?: number | null;
+    source_duration?: number;
+    [k: string]: unknown;
+  };
+  analysis: Analysis | null;
+  tempo_bpm: number | null;
+  time_signature: string;
+  offset_seconds: number;
+  tracks: Track[];
+  artifacts: Artifact[];
+  job: Job | null;
+}
+
+export type EngineId = "basic-pitch" | "pyin" | "drum-nmf";
+
+export interface EngineInfo {
+  id: EngineId;
+  label: string;
+  polyphonic: boolean;
+  description: string;
+  defaults: Record<string, number | null>;
+}
+
+export interface SystemInfo {
+  version: string;
+  device: string;
+  device_name: string | null;
+  models: { name: string; installed: boolean; sources: string[]; size_bytes: number; license: string; caveat: string | null }[];
+  engines: EngineInfo[];
+  formats: string[];
+  m4a_supported: boolean;
+  max_upload_mb: number;
+  max_duration_seconds: number;
+  retention_days: number;
+  auth_required: boolean;
+  queue: Record<string, number>;
+}
+
+export interface Peaks {
+  sample_rate: number;
+  samples_per_bucket: number;
+  min: number[];
+  max: number[];
+}

@@ -1,0 +1,17 @@
+backend/.venv/
+backend/data/
+backend/models/
+backend/.env
+**/__pycache__/
+.pytest_cache/
+frontend/node_modules/
+frontend/.next/
+frontend/next-env.d.ts
+frontend/test-results/
+frontend/playwright-report/
+frontend/tsconfig.tsbuildinfo
+.env
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+backend/*.log

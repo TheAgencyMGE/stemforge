@@ -1,0 +1,92 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: backend/requirements/lock.txt
+      - name: System libraries
+        run: sudo apt-get update && sudo apt-get install -y libsndfile1 ffmpeg
+      - name: Install (CPU torch + pinned lock, no transitive resolution)
+        run: |
+          pip install torch==2.11.0 torchaudio==2.11.0 --index-url https://download.pytorch.org/whl/cpu
+          pip install --no-deps -r requirements/lock.txt
+          pip install --no-deps -e .
+      - name: Lint
+        run: ruff check stemforge tests scripts
+      - name: Type check
+        run: mypy stemforge
+      - name: Cache model weights
+        uses: actions/cache@v4
+        with:
+          path: backend/models
+          key: models-${{ hashFiles('backend/stemforge/model_manifest.json') }}
+      - name: Download verified models
+        run: stemforge-models download htdemucs
+      - name: Tests (unit + integration + real-model pipeline on CPU)
+        env:
+          STEMFORGE_DEVICE: cpu
+        run: pytest -q -W ignore::DeprecationWarning
+
+  frontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+
+  e2e:
+    needs: [backend, frontend]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11", cache: pip, cache-dependency-path: backend/requirements/lock.txt }
+      - uses: actions/setup-node@v4
+        with: { node-version: "24", cache: npm, cache-dependency-path: frontend/package-lock.json }
+      - name: Backend
+        working-directory: backend
+        run: |
+          sudo apt-get update && sudo apt-get install -y libsndfile1 ffmpeg
+          pip install torch==2.11.0 torchaudio==2.11.0 --index-url https://download.pytorch.org/whl/cpu
+          pip install --no-deps -r requirements/lock.txt && pip install --no-deps -e .
+          stemforge-models download htdemucs
+          STEMFORGE_DEVICE=cpu nohup stemforge-api > api.log 2>&1 &
+          STEMFORGE_DEVICE=cpu nohup stemforge-worker > worker.log 2>&1 &
+      - name: Frontend e2e
+        working-directory: frontend
+        run: |
+          npm ci
+          npx playwright install --with-deps chromium
+          npm run test:e2e
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-logs
+          path: |
+            backend/*.log
+            frontend/test-results

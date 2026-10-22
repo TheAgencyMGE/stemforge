@@ -1,0 +1,79 @@
+# Local / single-host deployment.
+#   CPU:  docker compose up --build
+#   GPU:  docker compose -f docker-compose.yml -f docker-compose.gpu.yml up --build
+# First run downloads the pinned, SHA-256-verified model weights into the "models" volume.
+x-backend: &backend
+  build:
+    context: ./backend
+    additional_contexts:
+      samples: ./samples
+  image: stemforge-backend:latest
+  environment:
+    STEMFORGE_ENV: production
+    STEMFORGE_DATABASE_URL: postgresql+psycopg://stemforge:${POSTGRES_PASSWORD:-stemforge}@db:5432/stemforge
+    STEMFORGE_SIGNING_SECRET: ${STEMFORGE_SIGNING_SECRET:?set STEMFORGE_SIGNING_SECRET in .env}
+    STEMFORGE_API_TOKEN: ${STEMFORGE_API_TOKEN:-}
+    STEMFORGE_CORS_ORIGINS: '["http://localhost:3000"]'
+    STEMFORGE_RETENTION_DAYS: ${STEMFORGE_RETENTION_DAYS:-14}
+  volumes:
+    - data:/data
+    - models:/models
+  depends_on:
+    db:
+      condition: service_healthy
+    models:
+      condition: service_completed_successfully
+  restart: unless-stopped
+
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: stemforge
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-stemforge}
+      POSTGRES_DB: stemforge
+    volumes: [pg:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U stemforge"]
+      interval: 5s
+      retries: 20
+    restart: unless-stopped
+
+  models:
+    image: stemforge-backend:latest
+    build:
+      context: ./backend
+      additional_contexts:
+        samples: ./samples
+    command: ["stemforge-models", "download"]
+    volumes: [models:/models]
+    restart: "no"
+
+  api:
+    <<: *backend
+    command: ["stemforge-api", "--host", "0.0.0.0", "--port", "8000"]
+    expose: ["8000"]
+
+  worker:
+    <<: *backend
+    command: ["stemforge-worker"]
+    environment:
+      STEMFORGE_ENV: production
+      STEMFORGE_DATABASE_URL: postgresql+psycopg://stemforge:${POSTGRES_PASSWORD:-stemforge}@db:5432/stemforge
+      STEMFORGE_SIGNING_SECRET: ${STEMFORGE_SIGNING_SECRET:?set STEMFORGE_SIGNING_SECRET in .env}
+      STEMFORGE_WORKER_CONCURRENCY: ${STEMFORGE_WORKER_CONCURRENCY:-1}
+      STEMFORGE_RETENTION_DAYS: ${STEMFORGE_RETENTION_DAYS:-14}
+
+  web:
+    build:
+      context: ./frontend
+      args:
+        STEMFORGE_API_URL: http://api:8000
+    ports: ["127.0.0.1:3000:3000"]
+    depends_on: [api]
+    restart: unless-stopped
+
+volumes:
+  data:
+  models:
+  pg:
