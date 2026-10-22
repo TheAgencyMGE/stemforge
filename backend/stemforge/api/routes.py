@@ -23,9 +23,12 @@ from ..config import get_settings
 from ..db import get_db
 from ..models import Artifact, Job, Project, Track
 from ..pipeline import audio as audio_mod
+from ..pipeline.instruments import EXCLUDED_MODELS, families, get_instrument
 from ..pipeline.transcription import ENGINES
 from ..schemas import (
     EngineOut,
+    InstrumentCatalog,
+    InstrumentOut,
     JobOut,
     ModelStatus,
     NotesDoc,
@@ -154,6 +157,9 @@ def get_project(project_id: str, db: DB) -> ProjectDetail:
 class UploadOptions(BaseModel):
     name: str | None = Field(default=None, max_length=200)
     six_stem: bool = False
+    drum_kit: bool = False
+    transcribe_mix: bool = False
+    compare_engines: bool = False
     trim_start: float = Field(default=0.0, ge=0)
     trim_end: float | None = Field(default=None, gt=0)
 
@@ -218,7 +224,9 @@ def _create_project_from_file(db: Session, tmp: Path, filename: str, opts: Uploa
     p = Project(
         name=(opts.name or display_name_from_filename(clean))[:200], original_filename=clean, source_format=fmt,
         source_size=tmp.stat().st_size, status="queued", is_sample=is_sample,
-        options={"six_stem": opts.six_stem, "trim_start": opts.trim_start,
+        options={"six_stem": opts.six_stem, "drum_kit": opts.drum_kit,
+                 "transcribe_mix": opts.transcribe_mix, "compare_engines": opts.compare_engines,
+                 "trim_start": opts.trim_start,
                  "trim_end": opts.trim_end if opts.trim_end and opts.trim_end < info.duration else None,
                  "source_duration": round(info.duration, 3), "source_sample_rate": info.sample_rate,
                  "source_channels": info.channels},
@@ -251,6 +259,8 @@ def _upload_dir() -> Path:
 async def upload_project(
     request: Request, db: DB,
     name: str | None = Query(None, max_length=200), six_stem: bool = Query(False),
+    drum_kit: bool = Query(False), transcribe_mix: bool = Query(False),
+    compare_engines: bool = Query(False),
     trim_start: float = Query(0.0, ge=0), trim_end: float | None = Query(None, gt=0),
 ) -> ProjectDetail:
     """Upload raw audio bytes as the request body (streamed to disk with a size cap).
@@ -259,7 +269,8 @@ async def upload_project(
     """
     settings = get_settings()
     filename = unquote(request.headers.get("x-filename", "audio"))
-    opts = UploadOptions(name=name, six_stem=six_stem, trim_start=trim_start, trim_end=trim_end)
+    opts = UploadOptions(name=name, six_stem=six_stem, drum_kit=drum_kit, transcribe_mix=transcribe_mix,
+                         compare_engines=compare_engines, trim_start=trim_start, trim_end=trim_end)
     declared = request.headers.get("content-length")
     if declared and declared.isdigit():
         await run_in_threadpool(_check_quota, int(declared))
@@ -313,6 +324,26 @@ def delete_project(project_id: str, db: DB) -> None:
 
 class ReprocessIn(BaseModel):
     six_stem: bool | None = None
+    drum_kit: bool | None = None
+    transcribe_mix: bool | None = None
+    compare_engines: bool | None = None
+
+
+@router.get("/instruments", response_model=InstrumentCatalog)
+def list_instruments() -> InstrumentCatalog:
+    return InstrumentCatalog(families=families(), excluded_models=EXCLUDED_MODELS)
+
+
+@router.get("/instruments/{instrument_id}", response_model=InstrumentOut)
+def instrument_detail(instrument_id: str) -> InstrumentOut:
+    inst = get_instrument(instrument_id)
+    if inst is None:
+        raise ApiError(
+            404, "unknown_instrument",
+            f"No instrument {instrument_id!r}. Separation and transcription are limited to the catalog at /api/instruments. "
+            "Nothing is inferred for an unknown name.",
+        )
+    return InstrumentOut(**inst.to_public())
 
 
 @router.post("/projects/{project_id}/reprocess", response_model=JobOut, status_code=202)
@@ -321,8 +352,12 @@ def reprocess(project_id: str, body: ReprocessIn, db: DB) -> JobOut:
     p = _get_project(db, project_id)
     if _active_job(db, project_id):
         raise ApiError(409, "busy", "this project is already processing")
-    if body.six_stem is not None:
-        p.options = {**(p.options or {}), "six_stem": body.six_stem}
+    opts = dict(p.options or {})
+    for key in ("six_stem", "drum_kit", "transcribe_mix", "compare_engines"):
+        value = getattr(body, key)
+        if value is not None:
+            opts[key] = value
+    p.options = opts
     p.status = "queued"
     try:
         job = queue.enqueue(db, p.id, "process", {"six_stem": (p.options or {}).get("six_stem", False)})

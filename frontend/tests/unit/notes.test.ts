@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   History, cleanup, clampNote, deleteNotes, insertNote, moveNotes, notesInRect, pasteAt, pitchName, quantize,
+  revertOctaves, tablatureEstimate,
   resizeNotes, setVelocity, snapTime, snapToScale, transpose, type Grid,
 } from "@/lib/notes";
 import type { Note } from "@/lib/types";
@@ -39,6 +40,26 @@ describe("quantize", () => {
     const q = quantize([n("c", 60, 0.11, 0.4)], new Set(["c"]), grid, 1, true);
     expect(q[0].start).toBeCloseTo(0.1);
     expect(q[0].end).toBeCloseTo(0.35);
+  });
+});
+
+describe("octave restore and tablature", () => {
+  it("restores a corrected bass pitch and leaves other notes", () => {
+    const notes = [n("a", 40, 0, 1, { raw_pitch: 52, flags: ["octave_corrected"] }), n("b", 43, 1, 2)];
+    const out = revertOctaves(notes);
+    expect(out[0].pitch).toBe(52);
+    expect(out[0].raw_pitch).toBeNull();
+    expect(out[0].flags).toEqual([]);
+    expect(out[1]).toBe(notes[1]);
+  });
+  it("assigns standard-tuning frets and refuses a string collision", () => {
+    const lowE = tablatureEstimate([n("e", 40, 0, 1)]);
+    expect(lowE.events[0]).toMatchObject({ string: 6, fret: 0 });
+    const openA = tablatureEstimate([n("a", 45, 0, 1)]);
+    expect(openA.events[0]).toMatchObject({ string: 5, fret: 0 });
+    const clash = tablatureEstimate([n("e", 40, 0, 1), n("f", 41, 0.01, 1)]);
+    expect(clash.unassigned).toBe(1);
+    expect(clash.events.find((e) => e.pitch === 40)?.string).toBe(6);
   });
 });
 

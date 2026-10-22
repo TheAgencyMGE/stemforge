@@ -48,9 +48,10 @@ ENGINES: dict[str, EngineSpec] = {
         {"onset_threshold": 0.5, "frame_threshold": 0.5, "min_note_ms": 90, "min_freq": 65.0, "max_freq": 1100.0},
     ),
     "drum-nmf": EngineSpec(
-        "drum-nmf", "Drum NMF (kick/snare/hi-hat)", True,
-        "Semi-adaptive NMF of the drum stem into kick, snare and hi-hat templates; onsets are peak-picked "
-        "per template and mapped to GM 36/38/42.",
+        "drum-nmf", "Drum NMF (kit classes)", True,
+        "Semi-adaptive NMF with kick, snare and hi-hat templates (GM 36/38/42). A hit is relabeled "
+        "open hat, pedal hat, crash, tom, side-stick or clap only when its spectrum disagrees with that template. "
+        "No learned drum model is loaded.",
         {"onset_threshold": 0.5, "min_note_ms": 40},
     ),
 }
@@ -64,7 +65,12 @@ STEM_POLICY: dict[str, tuple[str, dict[str, Any], str]] = {
              "0.79) because it re-articulates repeated notes; switch to pYIN for legato lines."),
     "drums": ("drum-nmf", {},
               "Unpitched percussion needs event detection, not pitch tracking. NMF separates simultaneous "
-              "kick/snare/hi-hat hits that a single onset detector would merge."),
+              "kick, snare and hi-hat hits. Open hat, pedal hat, crash, toms, side-stick and clap are "
+              "relabels of those hits when the spectrum is clearly different, not extra neural classes. "
+              "Tambourine and shaker are not detected."),
+    "mix": ("basic-pitch", {},
+            "Direct polyphonic transcription of the original mix. Notes from every instrument share one "
+            "track. This is a comparison with the stem transcription, not a replacement for it."),
     "piano": ("basic-pitch", {"frame_threshold": 0.3},
               "Piano is polyphonic; Basic Pitch transcribes chords. Note: 6-stem piano separation bleeds."),
     "guitar": ("basic-pitch", {"frame_threshold": 0.3, "min_freq": 75.0},
@@ -271,36 +277,12 @@ def pyin_notes(track: dict[str, np.ndarray], y: np.ndarray, params: dict[str, An
 DRUM_CLASSES = ["kick", "snare", "hihat"]
 
 
-def _drum_templates(freqs: np.ndarray) -> np.ndarray:
-    lf = np.log2(np.maximum(freqs, 20.0))
-
-    def bump(center: float, width: float) -> np.ndarray:
-        return np.exp(-0.5 * ((lf - np.log2(center)) / width) ** 2)
-
-    kick = bump(60, 0.6)
-    snare = 0.6 * bump(200, 0.4) + 0.5 * ((freqs > 1000) & (freqs < 9000))
-    hihat = 1.0 * (freqs > 6000) + 0.05
-    W = np.stack([kick, snare, hihat], axis=1) + 1e-6
-    return W / W.sum(axis=0, keepdims=True)
-
-
 def drum_features(audio: np.ndarray, sr: int, iters: int = 40, fixed_iters: int = 10,
                   adapt: float = 0.5) -> dict[str, np.ndarray]:
-    import librosa
+    from .drums import factorize
 
-    y = to_mono(audio)
-    n_fft, hop = 2048, 256
-    S = np.abs(librosa.stft(y, n_fft=n_fft, hop_length=hop)).astype(np.float64)
-    W0 = _drum_templates(librosa.fft_frequencies(sr=sr, n_fft=n_fft))
-    W = W0.copy()
-    H = np.maximum(W.T @ S, 1e-6)
-    for it in range(iters):  # KL-divergence multiplicative updates
-        H *= (W.T @ (S / (W @ H + 1e-9))) / (W.sum(axis=0)[:, None] + 1e-9)
-        if it >= fixed_iters:
-            Wn = W * ((S / (W @ H + 1e-9)) @ H.T) / (H.sum(axis=1)[None, :] + 1e-9)
-            Wn /= Wn.sum(axis=0, keepdims=True)
-            W = adapt * W0 + (1 - adapt) * Wn
-    return {"H": H.astype(np.float32), "fps": np.array([sr / hop], dtype=np.float64)}
+    fac = factorize(audio, sr, iters=iters, fixed_iters=fixed_iters, adapt=adapt)
+    return {"H": fac["H"].astype(np.float32), "fps": np.array([fac["fps"]], dtype=np.float64)}
 
 
 def drum_notes(feats: dict[str, np.ndarray], params: dict[str, Any]) -> list[dict]:
@@ -352,7 +334,9 @@ def notes_from_features(engine: str, feats: dict[str, np.ndarray], audio: np.nda
     import librosa
 
     if engine == "drum-nmf":
-        return drum_notes(feats, params)
+        from .drums import refine_drum_notes
+
+        return refine_drum_notes(drum_notes(feats, params), audio, sr, params)
     y = librosa.resample(to_mono(audio), orig_sr=sr, target_sr=SR, res_type="soxr_hq")
     if engine == "basic-pitch":
         return basic_pitch_notes(feats, y, params)

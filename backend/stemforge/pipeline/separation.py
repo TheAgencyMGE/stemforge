@@ -42,6 +42,32 @@ def resolve_device() -> str:
 _MODEL_CACHE: dict[str, object] = {}
 
 
+def overlap_add(pieces: list[tuple[int, int, np.ndarray]], n: int, overlap: int) -> np.ndarray:
+    """Crossfade overlapping chunks back onto one timeline.
+
+    ``pieces`` are ``(start, end, array)`` with ``array.shape[-1] == end - start``. The fade is
+    the same ramp the separator used before this helper existed: a chunk that touches t=0 or the
+    end of the file is not faded on that edge, so a sample's time is never shifted.
+    """
+    if not pieces:
+        raise ValueError("no pieces to overlap-add")
+    out = np.zeros(pieces[0][2].shape[:-1] + (n,), dtype=np.float32)
+    norm = np.zeros(n, dtype=np.float32)
+    for lo, hi, res in pieces:
+        length = hi - lo
+        if res.shape[-1] != length:
+            raise ValueError("piece length does not match its window")
+        w = np.ones(length, dtype=np.float32)
+        ramp = min(2 * overlap, length // 2)
+        if lo > 0 and ramp > 0:
+            w[:ramp] = np.linspace(0, 1, ramp, dtype=np.float32)
+        if hi < n and ramp > 0:
+            w[-ramp:] = np.minimum(w[-ramp:], np.linspace(1, 0, ramp, dtype=np.float32))
+        out[..., lo:hi] += res.astype(np.float32) * w
+        norm[lo:hi] += w
+    return out / np.maximum(norm, 1e-8)
+
+
 class DemucsSeparator:
     """HTDemucs inference with outer chunking for bounded memory, progress and cancellation.
 
@@ -78,30 +104,21 @@ class DemucsSeparator:
         mean, std = float(ref.mean()), float(ref.std()) or 1.0
         wav = (wav - mean) / std
 
-        out = np.zeros((len(self.sources), 2, n), dtype=np.float32)
-        norm = np.zeros(n, dtype=np.float32)
         starts = list(range(0, n, chunk)) or [0]
         segment = settings.demucs_segment
         t0 = time.monotonic()
+        pieces: list[tuple[int, int, np.ndarray]] = []
         for i, s in enumerate(starts):
             lo, hi = max(0, s - overlap), min(n, s + chunk + overlap)
             piece = wav[:, lo:hi]
             res = self._run(apply_model, piece, device, segment)
-            w = np.ones(hi - lo, dtype=np.float32)
-            ramp = min(2 * overlap, (hi - lo) // 2)
-            if lo > 0 and ramp > 0:
-                w[:ramp] = np.linspace(0, 1, ramp, dtype=np.float32)
-            if hi < n and ramp > 0:
-                w[-ramp:] = np.minimum(w[-ramp:], np.linspace(1, 0, ramp, dtype=np.float32))
-            out[:, :, lo:hi] += res * w
-            norm[lo:hi] += w
+            pieces.append((lo, hi, res))
             on_progress((i + 1) / len(starts))
             log.info("separation chunk done", extra={
                 "model": self.model_name, "chunk": i + 1, "of": len(starts),
                 "elapsed": round(time.monotonic() - t0, 2), "device": device,
             })
-        out /= np.maximum(norm, 1e-8)
-        out = out * std + mean
+        out = overlap_add(pieces, n, overlap) * std + mean
         return {src: out[k] for k, src in enumerate(self.sources)}
 
     def _run(self, apply_model, piece, device: str, segment: float | None) -> np.ndarray:

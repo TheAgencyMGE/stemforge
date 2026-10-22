@@ -10,6 +10,9 @@ export interface Note {
   confidence: number | null;
   /** [seconds from note start, semitones] */
   bends: [number, number][] | null;
+  /** Pitch before an octave correction. Absent when the engine's pitch was kept. */
+  raw_pitch?: number | null;
+  flags?: string[] | null;
 }
 
 export interface NotesDoc {
@@ -60,6 +63,15 @@ export interface Track {
     low_confidence?: number;
     pitch_range?: [number, number];
     detail?: string;
+    coverage?: string;
+    suggestions?: { code: string; severity: "review" | "info" | string; message: string; note_ids?: string[] }[];
+    tablature?: {
+      estimate: boolean;
+      tuning: string;
+      disclaimer: string;
+      assigned: number;
+      unassigned: number;
+    };
   } | null;
 }
 
@@ -114,6 +126,12 @@ export interface Analysis {
   key: KeyInfo | null;
   sections: { start: number; end: number; label: string }[];
   silent: boolean;
+  meter?: {
+    time_signature: string | null;
+    beats_per_bar: number | null;
+    confidence: number;
+    downbeat: number | null;
+  };
 }
 
 export interface ProjectSummary {
@@ -134,6 +152,9 @@ export interface ProjectSummary {
 export interface ProjectDetail extends ProjectSummary {
   options: {
     six_stem?: boolean;
+    drum_kit?: boolean;
+    transcribe_mix?: boolean;
+    compare_engines?: boolean;
     trim_start?: number;
     trim_end?: number | null;
     source_duration?: number;

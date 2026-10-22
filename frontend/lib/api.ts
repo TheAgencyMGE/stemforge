@@ -63,8 +63,31 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
 export interface UploadOptions {
   name?: string;
   sixStem?: boolean;
+  drumKit?: boolean;
+  transcribeMix?: boolean;
+  compareEngines?: boolean;
   trimStart?: number;
   trimEnd?: number | null;
+}
+
+export interface InstrumentInfo {
+  id: string;
+  family: string;
+  name: string;
+  separate: "isolated" | "shared" | "masked" | "unavailable" | string;
+  transcribe: string;
+  stem: string | null;
+  engines: string[];
+  model: string | null;
+  limitation: string;
+  summary: string;
+  gm_program: number | null;
+  gm_note: number | null;
+}
+
+export interface InstrumentCatalog {
+  families: { id: string; instruments: InstrumentInfo[] }[];
+  excluded_models: { id: string; task: string; reason: string }[];
 }
 
 /** Upload raw bytes with progress (XHR, because fetch has no upload progress events). */
@@ -77,6 +100,9 @@ export function uploadProject(
   const q = new URLSearchParams();
   if (opts.name) q.set("name", opts.name);
   if (opts.sixStem) q.set("six_stem", "true");
+  if (opts.drumKit) q.set("drum_kit", "true");
+  if (opts.transcribeMix) q.set("transcribe_mix", "true");
+  if (opts.compareEngines) q.set("compare_engines", "true");
   if (opts.trimStart) q.set("trim_start", opts.trimStart.toFixed(3));
   if (opts.trimEnd) q.set("trim_end", opts.trimEnd.toFixed(3));
   return new Promise((resolve, reject) => {
@@ -109,6 +135,7 @@ export function uploadProject(
 
 export const api = {
   system: () => request<SystemInfo>("/system"),
+  instruments: () => request<InstrumentCatalog>("/instruments"),
   listProjects: () => request<ProjectSummary[]>("/projects"),
   getProject: (id: string) => request<ProjectDetail>(`/projects/${id}`),
   createSample: (sixStem = false) =>
@@ -116,8 +143,8 @@ export const api = {
   patchProject: (id: string, body: { name?: string; tempo_bpm?: number; time_signature?: string }) =>
     request<ProjectDetail>(`/projects/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
   deleteProject: (id: string) => request<void>(`/projects/${id}`, { method: "DELETE" }),
-  reprocess: (id: string, sixStem?: boolean) =>
-    request<Job>(`/projects/${id}/reprocess`, { method: "POST", body: JSON.stringify({ six_stem: sixStem }) }),
+  reprocess: (id: string, body: { six_stem?: boolean; drum_kit?: boolean; transcribe_mix?: boolean; compare_engines?: boolean }) =>
+    request<Job>(`/projects/${id}/reprocess`, { method: "POST", body: JSON.stringify(body) }),
   getJob: (id: string) => request<Job>(`/jobs/${id}`),
   cancelJob: (id: string) => request<Job>(`/jobs/${id}/cancel`, { method: "POST" }),
   retryJob: (id: string) => request<Job>(`/jobs/${id}/retry`, { method: "POST" }),

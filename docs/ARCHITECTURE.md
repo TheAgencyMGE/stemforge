@@ -2,7 +2,7 @@
 
 Stemforge is a local-first studio for taking a song apart. It splits the mix into stems, transcribes each stem to MIDI, and lets you edit and export the result.
 
-This document records what was researched, what was chosen, and why. It was written before implementation and updated afterwards wherever measurements changed a decision (see `docs/EVALUATION.md`).
+This document records what was researched, what was chosen, and why. It was written before implementation and updated afterwards wherever measurements changed a decision (see `docs/EVALUATION.md`). Wider instrument coverage, and the models that were reviewed and left out, are in [MODELS.md](MODELS.md). The same decisions are served at `/api/instruments`.
 
 ## 1. Research summary
 
@@ -45,7 +45,7 @@ Every stage writes its output to storage and records an `Artifact` row. A retrie
 | vocals | `pyin-melody`: pYIN f0 → note segmentation, plus pitch bends from the f0 contour | Vocals are mostly monophonic. pYIN gives a calibrated voiced probability, which we use directly as per-note confidence. Basic Pitch over-splits vibrato. |
 | bass | `basic-pitch` band-limited to 30–500 Hz, onset 0.6; `pyin` one click away | Planned as pYIN. Measurement reversed it: Basic Pitch F1 0.91 vs pYIN 0.79, because pYIN merges repeated same-pitch notes. pYIN remains better for legato lines. |
 | piano, guitar, other | `basic-pitch` (ONNX) | Polyphonic transcription is required. Confidence is the mean note activation. |
-| drums | `drum-nmf`: semi-adaptive NMF with kick, snare and hi-hat templates, then per-template onset peak-picking. Maps to GM 36/38/42. | No permissively licensed neural drum model exists. A band-flux prototype over-triggered (F1 0.49–0.72). NMF separates simultaneous hits (F1 1.0 on the fixture). |
+| drums | `drum-nmf`: semi-adaptive NMF with kick, snare and hi-hat templates (GM 36/38/42). A hit is relabeled open hat, pedal hat, crash, tom, side-stick or clap only when its spectrum disagrees with that template. | No permissively licensed neural drum model exists (ADTOF is CC BY-NC-SA). A band-flux prototype over-triggered (F1 0.49–0.72). NMF separates simultaneous hits (F1 1.0 on the fixture for the three coarse classes). |
 
 The user can override the engine per track and re-run transcription only for that track, using sensitivity (onset/frame thresholds) and a minimum note length. Separation is not re-run.
 
@@ -92,7 +92,7 @@ The piano roll shades notes by confidence. Notes below a user-set threshold are 
 * Separation quality is bounded by HTDemucs. Reverb tails and dense mixes bleed between stems.
 * Six-stem piano is unreliable upstream. Guitar is usable.
 * Polyphonic transcription of distorted guitar or dense synths is ambiguous and will show low confidence.
-* Drum transcription covers kick, snare, and hi-hat only. Toms and cymbals fold into the nearest template.
+* Drum transcription starts from kick, snare, and hi-hat templates. Open hat, pedal hat, crash, tom, side-stick and clap are spectral relabels, not a neural model. Ride, tambourine and shaker are not detected. Optional kit audio is an NMF mask of the drum stem, not a new separator.
 * M4A/AAC decoding needs FFmpeg (PyAV or the binary). The primary decoder is libsndfile (WAV, FLAC, OGG/Opus, MP3, AIFF), because PyAV's DLLs can be blocked by Windows Smart App Control.
 * Postgres, S3 and the Docker images are implemented but were not executed on the development machine.
 * Key detection is the global key only, and section labels are unsupervised (A/B/C), not "verse/chorus".

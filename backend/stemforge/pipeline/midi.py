@@ -163,6 +163,7 @@ def validate(path: Path, specs: list[MidiTrackSpec], bpm: float, offset: float =
     report: dict[str, Any] = {"parser": "symusic", "ticks_per_quarter": score.ticks_per_quarter, "tracks": []}
     if score.ticks_per_quarter != PPQ:
         raise MidiValidationError("ticks_per_quarter mismatch")
+    _validate_structure(path, specs)
     for s in specs:
         expected = _tick_notes(s.notes, bpm, offset)
         t = by_name.get(s.name[:64])
@@ -178,3 +179,46 @@ def validate(path: Path, specs: list[MidiTrackSpec], bpm: float, offset: float =
                 raise MidiValidationError(f"track {s.name!r}: onset/pitch mismatch after re-parse")
         report["tracks"].append({"name": s.name, "notes": got, "is_drum": bool(t.is_drum) if t is not None else s.is_drum})
     return report
+
+
+def _validate_structure(path: Path, specs: list[MidiTrackSpec]) -> None:
+    """Pair note-ons with note-offs and keep drum hits on channel 10, using mido's own reader."""
+    mid = mido.MidiFile(str(path))
+    if mid.ticks_per_beat != PPQ:
+        raise MidiValidationError("ticks_per_beat mismatch")
+    names = [t.name for t in mid.tracks if t]
+    # Track 0 is the meta track. Named music tracks follow.
+    music = [t for t in mid.tracks if any(m.type == "track_name" and m.name != "Stemforge" for m in t)]
+    if len(music) < len(specs):
+        # Fall back to every track after the conductor track.
+        music = list(mid.tracks[1:])
+    if len(music) != len(specs):
+        raise MidiValidationError(f"expected {len(specs)} music tracks, found {len(music)}")
+    for spec, track in zip(specs, music, strict=True):
+        open_counts: dict[tuple[int, int], int] = {}
+        saw_drum = False
+        for msg in track:
+            if msg.time < 0:
+                raise MidiValidationError(f"negative delta in {spec.name}")
+            if msg.type == "note_on" and msg.velocity > 0:
+                if spec.is_drum and msg.channel != 9:
+                    raise MidiValidationError(f"drum note on channel {msg.channel + 1}, expected 10")
+                if not spec.is_drum and msg.channel == 9:
+                    raise MidiValidationError(f"pitched note for {spec.name} landed on the drum channel")
+                key = (msg.channel, msg.note)
+                open_counts[key] = open_counts.get(key, 0) + 1
+                if spec.is_drum:
+                    saw_drum = True
+            elif msg.type == "note_off" or (msg.type == "note_on" and msg.velocity == 0):
+                key = (msg.channel, msg.note)
+                if open_counts.get(key, 0) <= 0:
+                    raise MidiValidationError(f"note-off without note-on in {spec.name}")
+                open_counts[key] -= 1
+                if open_counts[key] == 0:
+                    del open_counts[key]
+        if open_counts:
+            raise MidiValidationError(f"unmatched note-ons in {spec.name}")
+        if spec.is_drum and spec.notes and not saw_drum:
+            raise MidiValidationError(f"drum track {spec.name} has no drum-channel notes")
+    if "Stemforge" not in names and specs:
+        raise MidiValidationError("conductor track name missing")

@@ -99,6 +99,22 @@ def test_bundle_import_rejects_zip_slip(client):
     assert r.status_code == 422 and "unexpected entry" in r.json()["error"]["message"]
 
 
+def test_instrument_catalog_and_upload_options(client, tmp_path):
+    catalog = client.get("/api/instruments")
+    assert catalog.status_code == 200
+    ids = {row["id"] for family in catalog.json()["families"] for row in family["instruments"]}
+    assert "violin" in ids and "lead_vocal" in ids
+    missing = client.get("/api/instruments/theremin")
+    assert missing.status_code == 404 and missing.json()["error"]["code"] == "unknown_instrument"
+    violin = client.get("/api/instruments/violin").json()
+    assert violin["separate"] == "unavailable" and violin["model"] is None
+    tone = write_tone(tmp_path / "opt.wav", seconds=2)
+    r = upload(client, tone, drum_kit="true", transcribe_mix="true", compare_engines="true")
+    assert r.status_code == 201, r.text
+    opts = r.json()["options"]
+    assert opts["drum_kit"] is True and opts["transcribe_mix"] is True and opts["compare_engines"] is True
+
+
 # ---------------------------------------------------------------- full pipeline with real models
 
 

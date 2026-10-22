@@ -21,6 +21,10 @@ from ..config import get_settings
 from ..models import Artifact, Job, Project, Track, utcnow
 from ..storage import Storage, sha256_file
 from . import analysis, audio, midi, transcription
+from .drums import piece_audio
+from .instruments import stem_blurb
+from .refine import apply as refine_notes
+from .refine import comparison_engine, engine_disagreements
 from .separation import DemucsSeparator, residual_db
 
 log = logging.getLogger(__name__)
@@ -28,8 +32,17 @@ log = logging.getLogger(__name__)
 STAGES = ["decode", "analyze", "separate", "render", "transcribe", "midi"]
 STAGE_WEIGHTS = {"decode": 0.04, "analyze": 0.06, "separate": 0.5, "render": 0.12, "transcribe": 0.23, "midi": 0.05}
 RETRANSCRIBE_STAGES = ["transcribe", "midi"]
-STEM_ORDER = ["vocals", "drums", "bass", "guitar", "piano", "other"]
-STEM_LABEL = {"vocals": "Vocals", "drums": "Drums", "bass": "Bass", "guitar": "Guitar", "piano": "Piano", "other": "Other"}
+STEM_ORDER = [
+    "vocals", "drums", "kit_kick", "kit_snare", "kit_hats", "kit_perc",
+    "bass", "guitar", "piano", "other", "mix",
+]
+STEM_LABEL = {
+    "vocals": "Vocals", "drums": "Drums", "bass": "Bass", "guitar": "Guitar", "piano": "Piano",
+    "other": "Other", "mix": "Full mix",
+    "kit_kick": "Kick (mask)", "kit_snare": "Snare (mask)", "kit_hats": "Hats (mask)",
+    "kit_perc": "Percussion (mask)",
+}
+KIT_PIECES = ["kit_kick", "kit_snare", "kit_hats", "kit_perc"]
 SILENT_DB = -55.0  # absolute dBFS RMS
 RELATIVE_SILENT_DB = -40.0  # dB relative to the mix RMS
 LOW_LEVEL_DB = -20.0
@@ -243,8 +256,9 @@ def _run_process(ctx: JobContext) -> None:
         for s, art in existing.items():
             stems[s] = ctx.read_audio(art)  # type: ignore[arg-type]
             stem_models[s] = (art.meta or {}).get("model", base_model)  # type: ignore[union-attr]
-        ctx.end("separate", "skipped", "Reused stems from a previous attempt")
+        reused_stems = True
     else:
+        reused_stems = False
         try:
             sep4 = DemucsSeparator(base_model)
         except Exception as exc:
@@ -270,8 +284,15 @@ def _run_process(ctx: JobContext) -> None:
             audio.write_flac(local, stems[s], subtype="PCM_24")
             ctx.save_artifact("stem", s, local, ctx.key("stems", f"{s}.flac"), f"{_slug(p.name)}-{s}.flac",
                               "audio/flac", h_sep, {"model": stem_models[s]})
-        ctx.end("separate", message=f"{len(wanted)} stems", residual_db=residual_db(mix, stems))
-    resid = residual_db(mix, stems)
+    resid = residual_db(mix, {s: stems[s] for s in wanted if s in stems})
+    _maybe_drum_kit(ctx, stems, stem_models, h_sep, opts)
+    if opts.get("transcribe_mix"):
+        stems["mix"] = mix
+        stem_models["mix"] = "basic-pitch:full-mix"
+    if reused_stems:
+        ctx.end("separate", "skipped", "Reused stems from a previous attempt", residual_db=resid)
+    else:
+        ctx.end("separate", message=f"{len(wanted)} stems", residual_db=resid)
 
     # ---- tracks + render (previews, peaks, spectrograms)
     _upsert_tracks(ctx, stems, stem_models, resid, audio.level_stats(mix)["rms_db"])
@@ -289,7 +310,8 @@ def _run_process(ctx: JobContext) -> None:
             audio.write_flac(local, data, subtype="PCM_16")
             ctx.save_artifact("preview", name, local, ctx.key("preview", f"{name}.flac"), f"{name}.flac",
                               "audio/flac", h_r)
-        if name != "original" and name != "drums" and not ctx.find_artifact("spectrogram", name, h_r):
+        pitched = name != "original" and name != "drums" and not name.startswith("kit_")
+        if pitched and not ctx.find_artifact("spectrogram", name, h_r):
             local = ctx.tmp / f"{name}.cqt.png"
             meta = audio.pitch_spectrogram_png(data, audio.TARGET_SR, local)
             ctx.save_artifact("spectrogram", name, local, ctx.key("spectrogram", f"{name}.png"),
@@ -302,7 +324,11 @@ def _run_process(ctx: JobContext) -> None:
                     key=lambda t: t.order_index)
     ctx.begin("transcribe", "Transcribing stems to MIDI")
     for i, tr in enumerate(tracks):
-        if tr.engine is None:
+        if tr.stem.startswith("kit_"):
+            tr.engine = tr.engine or "drum-nmf"
+            tr.engine_params = tr.engine_params or {}
+            tr.engine_reason = "Listening mask of the drum stem. Hits are transcribed on the Drums track."
+        elif tr.engine is None:
             eng, params, reason = transcription.choose_engine(tr.stem)
             tr.engine, tr.engine_params, tr.engine_reason = eng, params, reason
         label = f"Transcribing {tr.display_name} ({tr.engine})"
@@ -353,6 +379,9 @@ def _upsert_tracks(ctx: JobContext, stems: dict[str, np.ndarray], models: dict[s
                             "come from bleed of other instruments rather than a real part.")
         if stats["clipped_ratio"] > 0.001:
             warnings.append("Stem has clipped samples; separation output exceeded full scale.")
+        blurb = stem_blurb(s)
+        if blurb:
+            warnings.insert(0, blurb)
         tr = existing.get(s)
         # Edits only survive a re-run if the stem audio came from the same model.
         stats["model_changed"] = bool(tr is not None and tr.source_model and tr.source_model != models[s])
@@ -362,15 +391,52 @@ def _upsert_tracks(ctx: JobContext, stems: dict[str, np.ndarray], models: dict[s
         tr.display_name = tr.display_name or STEM_LABEL.get(s, s.title())
         tr.order_index = idx
         tr.source_model = models[s]
-        tr.is_drum = s == "drums"
+        tr.is_drum = s == "drums" or s.startswith("kit_")
         tr.gm_program = transcription.GM_PROGRAM.get(s, 0)
         tr.stats = stats
         tr.warnings = warnings
+    for stem, old in existing.items():
+        if stem not in stems and (stem.startswith("kit_") or stem == "mix"):
+            ctx.db.delete(old)
     ctx.db.commit()
+
+
+def _maybe_drum_kit(ctx: JobContext, stems: dict[str, np.ndarray], models: dict[str, str], h_sep: str,
+                    opts: dict[str, Any]) -> None:
+    """Optional NMF masks of the drum stem. They are not added to the mix-residual sum."""
+    if not opts.get("drum_kit") or "drums" not in stems:
+        return
+    h_kit = phash({"sep": h_sep, "kit": "nmf-v1"})
+    found = {name: ctx.find_artifact("stem", name, h_kit) for name in KIT_PIECES}
+    if all(found.values()):
+        for name, art in found.items():
+            stems[name] = ctx.read_audio(art)  # type: ignore[arg-type]
+            models[name] = (art.meta or {}).get("model", "nmf-mask:drum-stem")  # type: ignore[union-attr]
+        return
+    ctx.progress("separate", 0.98, "Splitting the drum stem into kit pieces")
+    for name, data in piece_audio(stems["drums"], audio.TARGET_SR).items():
+        stems[name] = data
+        models[name] = "nmf-mask:drum-stem"
+        local = ctx.tmp / f"{name}.flac"
+        audio.write_flac(local, data, subtype="PCM_24")
+        ctx.save_artifact("stem", name, local, ctx.key("stems", f"{name}.flac"),
+                          f"{_slug(ctx.project.name)}-{name}.flac", "audio/flac", h_kit,
+                          {"model": models[name], "parent": "drums"})
 
 
 def _transcribe_track(ctx: JobContext, tr: Track, data: np.ndarray, h_sep: str, preserve_edits: bool,
                       frac) -> None:
+    if tr.stem.startswith("kit_"):
+        tr.transcription_status = "skipped"
+        tr.transcription_detail = json.dumps({
+            "count": 0,
+            "detail": "Kit piece is a mask for listening. Drum hits are on the Drums track, so this piece is not transcribed again.",
+        })
+        tr.generated_notes, tr.notes = [], []
+        tr.notes_version += 1
+        ctx.db.commit()
+        frac(1.0)
+        return
     if (tr.stats or {}).get("silent"):
         tr.transcription_status = "skipped"
         tr.transcription_detail = "Stem is silent; nothing to transcribe."
@@ -381,30 +447,49 @@ def _transcribe_track(ctx: JobContext, tr: Track, data: np.ndarray, h_sep: str, 
         return
     engine = tr.engine or transcription.choose_engine(tr.stem)[0]
     params = transcription.resolve_params(engine, tr.engine_params)
-    h_feat = phash({"sep": h_sep, "stem": tr.stem, "engine": engine,
+    notes = _notes_for_engine(ctx, tr.stem, engine, params, data, h_sep, tr.stem)
+    frac(0.7)
+    refined = refine_notes(tr.stem, engine, notes, data, audio.TARGET_SR)
+    suggestions = list(refined.suggestions)
+    if (ctx.project.options or {}).get("compare_engines"):
+        secondary = comparison_engine(tr.stem, engine)
+        if secondary:
+            band = {k: params[k] for k in ("min_freq", "max_freq") if params.get(k) is not None}
+            sec_params = transcription.resolve_params(secondary, band)
+            # A separate artifact stem so the comparison cache does not replace the primary one.
+            sec_notes = _notes_for_engine(ctx, tr.stem, secondary, sec_params, data, h_sep, f"{tr.stem}__{secondary}")
+            suggestions.extend(engine_disagreements(refined.notes, sec_notes, secondary))
+    edited = tr.notes_version > 0 and tr.notes != tr.generated_notes and not (tr.stats or {}).get("model_changed")
+    tr.generated_notes = refined.notes
+    if not (preserve_edits and edited):
+        tr.notes = refined.notes
+        tr.notes_version += 1
+    tr.engine, tr.engine_params = engine, params
+    tr.transcription_status = "done"
+    summary = transcription.summarize(refined.notes)
+    summary["suggestions"] = suggestions
+    summary["coverage"] = stem_blurb(tr.stem)
+    if refined.tablature is not None:
+        summary["tablature"] = refined.tablature
+    tr.transcription_detail = json.dumps(summary)
+    ctx.db.commit()
+    frac(1.0)
+
+
+def _notes_for_engine(ctx: JobContext, stem: str, engine: str, params: dict[str, Any], data: np.ndarray,
+                      h_sep: str, feature_stem: str) -> list[dict]:
+    h_feat = phash({"sep": h_sep, "stem": stem, "engine": engine,
                     "fp": transcription.feature_key_params(engine, params), "v": 1})
-    art = ctx.find_artifact("features", tr.stem, h_feat)
+    art = ctx.find_artifact("features", feature_stem, h_feat)
     if art is not None:
         feats = ctx.read_npz(art)
     else:
         feats = transcription.compute_features(engine, data, audio.TARGET_SR, params)
-        local = ctx.tmp / f"{tr.stem}.{engine}.npz"
+        local = ctx.tmp / f"{feature_stem}.{engine}.npz"
         np.savez_compressed(local, **feats)
-        ctx.save_artifact("features", tr.stem, local, ctx.key("features", f"{tr.stem}-{engine}.npz"),
-                          f"{tr.stem}-{engine}.npz", "application/octet-stream", h_feat, {"engine": engine})
-    frac(0.7)
-    notes = transcription.notes_from_features(engine, feats, data, audio.TARGET_SR, params)
-    edited = tr.notes_version > 0 and tr.notes != tr.generated_notes and not (tr.stats or {}).get("model_changed")
-    tr.generated_notes = notes
-    if not (preserve_edits and edited):
-        tr.notes = notes
-        tr.notes_version += 1
-    tr.engine, tr.engine_params = engine, params
-    tr.transcription_status = "done"
-    summary = transcription.summarize(notes)
-    tr.transcription_detail = json.dumps(summary)
-    ctx.db.commit()
-    frac(1.0)
+        ctx.save_artifact("features", feature_stem, local, ctx.key("features", f"{feature_stem}-{engine}.npz"),
+                          f"{feature_stem}-{engine}.npz", "application/octet-stream", h_feat, {"engine": engine})
+    return transcription.notes_from_features(engine, feats, data, audio.TARGET_SR, params)
 
 
 def _write_midi(ctx: JobContext) -> None:

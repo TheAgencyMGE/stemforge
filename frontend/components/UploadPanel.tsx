@@ -47,6 +47,9 @@ export function UploadPanel({ system }: { system: SystemInfo | null }) {
   const [error, setError] = useState<string | null>(null);
   const [name, setName] = useState("");
   const [sixStem, setSixStem] = useState(false);
+  const [drumKit, setDrumKit] = useState(false);
+  const [transcribeMix, setTranscribeMix] = useState(false);
+  const [compareEngines, setCompareEngines] = useState(false);
   const [trim, setTrim] = useState<[number, number] | null>(null);
   const [progress, setProgress] = useState<number | null>(null);
   const [busy, setBusy] = useState(false);
@@ -101,7 +104,10 @@ export function UploadPanel({ system }: { system: SystemInfo | null }) {
     try {
       const p = await uploadProject(
         picked.file,
-        { name: name.trim() || undefined, sixStem, trimStart: trim?.[0], trimEnd: trim && picked.duration && trim[1] < picked.duration - 0.01 ? trim[1] : null },
+        {
+          name: name.trim() || undefined, sixStem, drumKit, transcribeMix, compareEngines,
+          trimStart: trim?.[0], trimEnd: trim && picked.duration && trim[1] < picked.duration - 0.01 ? trim[1] : null,
+        },
         (f) => setProgress(f),
         abortRef.current.signal,
       );
@@ -211,6 +217,32 @@ export function UploadPanel({ system }: { system: SystemInfo | null }) {
               <span className="faint"> · experimental: upstream notes the piano stem bleeds noticeably</span>
             </span>
           </label>
+          <details>
+            <summary className="faint" style={{ cursor: "pointer", fontSize: 13 }}>More separation and transcription options</summary>
+            <div className="stack" style={{ gap: 8, marginTop: 8 }}>
+              <label className="check">
+                <input type="checkbox" checked={drumKit} onChange={(e) => setDrumKit(e.target.checked)} />
+                <span>
+                  Split the drum stem into kick, snare, hat and residual masks
+                  <span className="faint"> · listening only. MIDI stays on the Drums track. Not a second neural model.</span>
+                </span>
+              </label>
+              <label className="check">
+                <input type="checkbox" checked={transcribeMix} onChange={(e) => setTranscribeMix(e.target.checked)} />
+                <span>
+                  Also transcribe the full mix
+                  <span className="faint"> · one Basic Pitch track of everything at once, for comparison.</span>
+                </span>
+              </label>
+              <label className="check">
+                <input type="checkbox" checked={compareEngines} onChange={(e) => setCompareEngines(e.target.checked)} />
+                <span>
+                  Compare a second engine on bass and vocals
+                  <span className="faint"> · disagreements are listed. Notes are not averaged or deleted. Slower.</span>
+                </span>
+              </label>
+            </div>
+          </details>
           {tooLong && <div className="warnbox">The selection is longer than {Math.round(maxDur / 60)} min. Drag on the waveform to choose a section.</div>}
           {progress !== null && (
             <div className="stack" style={{ gap: 4 }}>

@@ -4,6 +4,7 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { AppHeader } from "@/components/Brand";
+import { Coverage } from "@/components/Coverage";
 import { SampleButton, UploadPanel } from "@/components/UploadPanel";
 import { api, errorMessage, importBundle } from "@/lib/api";
 import { fmtAgo, fmtTime } from "@/lib/format";
@@ -157,6 +158,11 @@ export default function Home() {
               ))}
             </div>
           )}
+        </section>
+
+        <section className="stack">
+          <h2>What can actually be separated</h2>
+          <Coverage />
         </section>
 
         {system && (

@@ -131,6 +131,79 @@ export function transpose(notes: Note[], ids: Set<string>, semitones: number): N
   return moveNotes(notes, ids, 0, semitones, Infinity);
 }
 
+/** Put back pitches that the bass octave check moved. Other notes are unchanged. */
+export function revertOctaves(notes: Note[]): Note[] {
+  return notes.map((n) => {
+    if (n.raw_pitch == null) return n;
+    return {
+      ...n,
+      pitch: n.raw_pitch,
+      raw_pitch: null,
+      flags: (n.flags ?? []).filter((f) => f !== "octave_corrected"),
+    };
+  });
+}
+
+const GUITAR_TUNING = [40, 45, 50, 55, 59, 64];
+
+export interface TabEvent {
+  note_id: string;
+  start: number;
+  pitch: number;
+  string: number | null;
+  fret: number | null;
+}
+
+/** Standard-tuning fret estimate. Same rule as the backend: lowest free fret, then a lower string. */
+export function tablatureEstimate(notes: Note[], maxFret = 15): {
+  estimate: true;
+  tuning: string;
+  disclaimer: string;
+  assigned: number;
+  unassigned: number;
+  events: TabEvent[];
+} {
+  const ordered = [...notes].sort((a, b) => a.start - b.start || a.pitch - b.pitch);
+  const groups: Note[][] = [];
+  for (const note of ordered) {
+    const last = groups[groups.length - 1];
+    if (last && note.start - last[0].start <= 0.035) last.push(note);
+    else groups.push([note]);
+  }
+  const events: TabEvent[] = [];
+  let unassigned = 0;
+  for (const group of groups) {
+    const used = new Set<number>();
+    for (const note of [...group].sort((a, b) => a.pitch - b.pitch)) {
+      const candidates: { fret: number; index: number }[] = [];
+      GUITAR_TUNING.forEach((open, index) => {
+        const fret = note.pitch - open;
+        if (!used.has(index) && fret >= 0 && fret <= maxFret) candidates.push({ fret, index });
+      });
+      candidates.sort((a, b) => a.fret - b.fret || a.index - b.index);
+      const choice = candidates[0];
+      if (!choice) {
+        unassigned += 1;
+        events.push({ note_id: note.id, start: note.start, pitch: note.pitch, string: null, fret: null });
+        continue;
+      }
+      used.add(choice.index);
+      events.push({
+        note_id: note.id, start: note.start, pitch: note.pitch,
+        string: 6 - choice.index, fret: choice.fret,
+      });
+    }
+  }
+  return {
+    estimate: true,
+    tuning: "EADGBE",
+    disclaimer: "Standard-tuning fret estimate. Bends, slides and the real fingering are not detected.",
+    assigned: events.length - unassigned,
+    unassigned,
+    events,
+  };
+}
+
 export function removeBends(notes: Note[], ids: Set<string>): Note[] {
   return notes.map((n) => (ids.has(n.id) ? { ...n, bends: null } : n));
 }
@@ -184,7 +257,7 @@ export function pitchName(p: number): string {
 export const DRUM_NAMES: Record<number, string> = {
   35: "Kick 2", 36: "Kick", 37: "Side stick", 38: "Snare", 39: "Clap", 40: "Snare 2", 41: "Tom low",
   42: "Hi-hat closed", 43: "Tom low 2", 44: "Hi-hat pedal", 45: "Tom mid", 46: "Hi-hat open", 47: "Tom mid 2",
-  48: "Tom high", 49: "Crash", 50: "Tom high 2", 51: "Ride",
+  48: "Tom high", 49: "Crash", 50: "Tom high 2", 51: "Ride", 54: "Tambourine", 70: "Shaker",
 };
 
 /** Undo/redo history of whole-track snapshots (note arrays are immutable, so snapshots share structure). */

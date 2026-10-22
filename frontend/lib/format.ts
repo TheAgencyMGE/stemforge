@@ -44,6 +44,11 @@ export const STEM_COLOR: Record<string, string> = {
   piano: "var(--stem-piano)",
   other: "var(--stem-other)",
   original: "var(--stem-original)",
+  mix: "var(--stem-original)",
+  kit_kick: "var(--stem-drums)",
+  kit_snare: "var(--stem-drums)",
+  kit_hats: "var(--stem-drums)",
+  kit_perc: "var(--stem-drums)",
 };
 
 /** Hex versions for canvas drawing (CSS variables are not resolvable inside canvas). */
@@ -55,4 +60,9 @@ export const STEM_HEX: Record<string, string> = {
   piano: "#c792ea",
   other: "#4fd1c5",
   original: "#9aa3ad",
+  mix: "#9aa3ad",
+  kit_kick: "#ef6f6c",
+  kit_snare: "#ef6f6c",
+  kit_hats: "#ef6f6c",
+  kit_perc: "#e0a090",
 };

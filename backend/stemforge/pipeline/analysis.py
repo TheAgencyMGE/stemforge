@@ -47,6 +47,7 @@ def analyze(audio: np.ndarray, sr: int) -> dict:
     result["tempo_confidence"] = round(tempo_conf, 3)
     result["beats"] = [round(float(b), 4) for b in beats]
     result["first_beat"] = round(float(beats[0]), 4) if len(beats) else 0.0
+    result["meter"] = estimate_meter(onset_env, beat_frames, tempo)
 
     chroma = librosa.feature.chroma_cqt(y=y, sr=SR, hop_length=HOP)
     result["key"] = estimate_key(chroma.mean(axis=1))
@@ -68,6 +69,58 @@ def _tempo_confidence(onset_env: np.ndarray, tempo: float) -> float:
         return 0.0
     window = ac[max(1, lag - 2): lag + 3]
     return float(np.clip(window.max(), 0.0, 1.0))
+
+
+def estimate_meter(onset_env: np.ndarray, beat_frames: np.ndarray, tempo: float) -> dict:
+    """Guess a meter from which beats are accented. Equal accents stay undecided.
+
+    This is not madmom downbeat tracking. The project time signature is not changed from this value.
+    """
+    unknown = {"time_signature": None, "beats_per_bar": None, "confidence": 0.0, "downbeat": None}
+    if tempo <= 0 or len(beat_frames) < 12 or onset_env.size < 8:
+        return unknown
+    strengths = []
+    for frame in beat_frames:
+        i = int(frame)
+        if 0 <= i < len(onset_env):
+            lo, hi = max(0, i - 1), min(len(onset_env), i + 2)
+            strengths.append(float(onset_env[lo:hi].max()))
+    if len(strengths) < 12:
+        return unknown
+    sigs = []
+    for beats_per_bar in (2, 3, 4, 6):
+        best_contrast = -1.0
+        best_phase = 0
+        for phase in range(beats_per_bar):
+            groups: list[list[float]] = [[] for _ in range(beats_per_bar)]
+            for i, level in enumerate(strengths):
+                groups[(i - phase) % beats_per_bar].append(level)
+            means = np.array([float(np.mean(g)) if g else 0.0 for g in groups])
+            if means[0] < float(means.max()) - 1e-9:
+                continue
+            others = float(np.mean(means[1:])) if beats_per_bar > 1 else 0.0
+            contrast = (float(means[0]) - others) / (float(np.mean(means)) + 1e-9)
+            if contrast > best_contrast:
+                best_contrast = contrast
+                best_phase = phase
+        if best_contrast >= 0:
+            sigs.append((best_contrast, beats_per_bar, best_phase))
+    if not sigs:
+        return unknown
+    sigs.sort(reverse=True)
+    best, second = sigs[0], sigs[1] if len(sigs) > 1 else (0.0, 0, 0)
+    confidence = float(np.clip((best[0] - second[0]) / (abs(best[0]) + 1e-9), 0.0, 1.0))
+    # A flat click track has almost no contrast. A near-tie (2/4 vs 4/4 on an even
+    # backbeat) is the same kind of guess. Refuse both rather than name a meter.
+    if best[0] < 0.12 or confidence < 0.25:
+        return unknown
+    signature = {2: "2/4", 3: "3/4", 4: "4/4", 6: "6/8"}[best[1]]
+    return {
+        "time_signature": signature,
+        "beats_per_bar": best[1],
+        "confidence": round(confidence, 3),
+        "downbeat": int(best[2]),
+    }
 
 
 def estimate_key(chroma_mean: np.ndarray) -> dict:

@@ -29,6 +29,12 @@ Metric: mir_eval note onset F1 (50 ms tolerance, pitch within 50 cents, offsets 
 
 Separation uses `shifts=0`, so it is deterministic and resumed jobs reproduce stems exactly.
 
+## Later coverage work (not re-scored here)
+
+The table above is the last run of `backend/scripts/evaluate.py` and still describes the three coarse drum classes on this fixture. Spectral relabeling of open hats, toms and the other finer classes was checked on synthetic hits in `tests/test_coverage.py`, not by regenerating this file. A later CPU play-through of the same demo (HTDemucs, drum NMF) kept the drum MIDI at kick 30, snare 24, and closed hat 66, so those hits were not relabeled. Onset F1 was not recomputed. Bass came out as 104 notes against the table's 103; that count was not scored.
+
+Bass octave correction and the review suggestions are also outside this table. They do not delete notes. `evaluate.py` scores `notes_from_features` before that review step.
+
 ## Design decisions this evaluation drove
 
 * **Drums.** A first band-wise spectral-flux detector over-triggered badly: kick F1 0.63 and snare F1 0.49, from cross-band leakage. It was replaced by semi-adaptive NMF (F1 1.0 on every class here).

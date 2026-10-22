@@ -6,10 +6,10 @@ Stemforge's own code is MIT-licensed. It depends on the projects below. **No mod
 
 | Component | Source | Code license | Weights |
 |---|---|---|---|
-| HTDemucs (`htdemucs`, `htdemucs_6s`, `htdemucs_ft`) | https://github.com/adefossez/demucs; weights from `huggingface.co/adefossez/HTDemucs*` at pinned commits | MIT | The weight repositories state no license. They were trained by Meta AI on MUSDB18-HQ plus internal data. Treat commercial use as unverified. |
+| HTDemucs (`htdemucs`, `htdemucs_6s`, `htdemucs_ft`) | https://github.com/adefossez/demucs; weights from `huggingface.co/adefossez/HTDemucs*` at pinned commits | MIT | The weight repositories state no license. The maintainer has said the weights are not covered by MIT and are provided for scientific purposes (facebookresearch/demucs#327). `htdemucs` was trained by Meta AI on MUSDB18-HQ plus internal data. For `htdemucs_6s` the author said the training data is Meta's and gave no commercial answer (demucs#418). Treat commercial use as unverified. |
 | Basic Pitch (ICASSP 2022) | https://github.com/spotify/basic-pitch | Apache-2.0 | The model files ship inside the Apache-2.0 package, and the repo states no separate weight license. |
 | pYIN | librosa (`librosa.pyin`) | ISC | No learned weights |
-| Drum NMF | Stemforge (`stemforge/pipeline/transcription.py`), after Dittmar & Gärtner, DAFx 2014 | MIT | Fixed templates defined in code |
+| Drum NMF | Stemforge (`stemforge/pipeline/drums.py`, `transcription.py`), after Dittmar & Gärtner, DAFx 2014 | MIT | Fixed templates defined in code. No ADTOF weights. Spectral relabels (open hat, tom, crash, and so on) are rules in this repo, not a checkpoint. |
 
 Evaluated but **not bundled**:
 

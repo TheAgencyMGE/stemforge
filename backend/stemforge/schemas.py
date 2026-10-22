@@ -19,6 +19,9 @@ class Note(BaseModel):
     # None = authored by the user (no model confidence exists for it).
     confidence: float | None = Field(default=None, ge=0, le=1)
     bends: list[tuple[float, float]] | None = None
+    # Set when a review step changed the pitch. The editor can put this pitch back.
+    raw_pitch: int | None = Field(default=None, ge=0, le=127)
+    flags: list[str] | None = None
 
     @model_validator(mode="after")
     def _order(self) -> Note:
@@ -36,6 +39,21 @@ class Note(BaseModel):
         if len(v) > 2000:
             raise ValueError("too many bend points")
         return [(float(t), max(-2.0, min(2.0, float(s)))) for t, s in v]
+
+    @field_validator("flags")
+    @classmethod
+    def _flags(cls, v):
+        if v is None:
+            return v
+        if len(v) > 8:
+            raise ValueError("too many note flags")
+        cleaned = []
+        for item in v:
+            text = str(item)
+            if len(text) > 40 or not text.replace("_", "").isalnum():
+                raise ValueError("invalid note flag")
+            cleaned.append(text)
+        return cleaned
 
 
 class NotesDoc(BaseModel):
@@ -146,6 +164,28 @@ class TrackPatch(BaseModel):
 class RetranscribeIn(BaseModel):
     engine: Literal["basic-pitch", "pyin", "drum-nmf"] | None = None
     params: dict[str, float | None] = {}
+
+
+class InstrumentOut(BaseModel):
+    id: str
+    family: str
+    name: str
+    separate: str
+    transcribe: str
+    stem: str | None
+    engines: list[str]
+    gm_program: int | None
+    gm_note: int | None
+    pitch_min: int | None
+    pitch_max: int | None
+    model: str | None
+    limitation: str
+    summary: str
+
+
+class InstrumentCatalog(BaseModel):
+    families: list[dict[str, Any]]
+    excluded_models: list[dict[str, str]]
 
 
 class EngineOut(BaseModel):

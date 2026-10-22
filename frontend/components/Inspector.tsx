@@ -3,14 +3,14 @@
 import { useEffect, useMemo, useState } from "react";
 import { useWorkspace } from "./Workspace";
 import { api, downloadFromApi, errorMessage } from "@/lib/api";
-import { cleanup, removeBends } from "@/lib/notes";
+import { cleanup, removeBends, revertOctaves, tablatureEstimate } from "@/lib/notes";
 import { flushSaves, useEditor } from "@/lib/store";
-import type { EngineId, Job, Track } from "@/lib/types";
+import type { EngineId, Job, Note, Track } from "@/lib/types";
 
 const ENGINE_LABEL: Record<EngineId, string> = {
   "basic-pitch": "Basic Pitch (polyphonic)",
   pyin: "pYIN (monophonic melody)",
-  "drum-nmf": "Drum NMF (kick/snare/hi-hat)",
+  "drum-nmf": "Drum NMF (kit classes)",
 };
 
 const PARAM_META: Record<string, { label: string; min: number; max: number; step: number; help: string }> = {
@@ -120,6 +120,12 @@ function TrackInspector({ track }: { track: Track }) {
           <dt>Below threshold</dt><dd>{lowCount}</dd>
         </dl>
         {track.warnings.map((w) => <div key={w} className="warnbox">{w}</div>)}
+        {summary?.suggestions?.map((s) => (
+          <div key={s.code} className={s.severity === "info" ? "reason" : "warnbox"}>
+            <strong>{s.severity === "info" ? "Note" : "Review"} · {s.code.replaceAll("_", " ")}</strong>
+            <div>{s.message}</div>
+          </div>
+        ))}
       </section>
 
       <section>
@@ -192,6 +198,11 @@ function TrackInspector({ track }: { track: Track }) {
           {!track.is_drum && (
             <button className="btn sm" onClick={() => edit(track.id, (cur) => removeBends(cur, new Set(cur.map((n) => n.id))))}>Remove all pitch bends</button>
           )}
+          {(notes ?? []).some((n) => n.raw_pitch != null) && (
+            <button className="btn sm" onClick={() => edit(track.id, (cur) => revertOctaves(cur))}>
+              Restore pitches moved by the octave check
+            </button>
+          )}
           <button
             className="btn sm"
             disabled={!editedLocally}
@@ -211,6 +222,8 @@ function TrackInspector({ track }: { track: Track }) {
           </button>
         </section>
       )}
+
+      {track.stem === "guitar" && (notes?.length ?? 0) > 0 && <GuitarTab notes={notes ?? []} />}
 
       <section>
         <h3>Download</h3>
@@ -239,6 +252,24 @@ function TrackInspector({ track }: { track: Track }) {
   );
 }
 
+function GuitarTab({ notes }: { notes: Note[] }) {
+  const tab = tablatureEstimate(notes);
+  return (
+    <section>
+      <h3>Tablature estimate</h3>
+      <div className="reason">{tab.disclaimer} Tuning {tab.tuning}. {tab.assigned} assigned, {tab.unassigned} left unassigned where two notes needed the same string.</div>
+      <details>
+        <summary className="faint" style={{ fontSize: 12, cursor: "pointer" }}>Fret assignments</summary>
+        <div className="mono" style={{ fontSize: 12, maxHeight: 160, overflow: "auto" }}>
+          {tab.events.slice(0, 80).map((e) => (
+            <div key={e.note_id}>{e.string == null ? "— no free string" : `string ${e.string} fret ${e.fret}`}</div>
+          ))}
+        </div>
+      </details>
+    </section>
+  );
+}
+
 function ProjectSection() {
   const { project, reload } = useWorkspace();
   const toast = useEditor((s) => s.toast);
@@ -254,7 +285,7 @@ function ProjectSection() {
               if (!confirm("Run htdemucs_6s to add guitar and piano stems? The existing vocals/drums/bass are reused; the 'Other' stem is replaced by the 6-stem residual and re-transcribed.")) return;
               try {
                 await flushSaves().catch(() => undefined);
-                await api.reprocess(project.id, true);
+                await api.reprocess(project.id, { six_stem: true });
                 await reload();
               } catch (e) {
                 toast("error", errorMessage(e));
@@ -266,8 +297,65 @@ function ProjectSection() {
           <div className="faint" style={{ fontSize: 12 }}>Experimental: upstream reports heavy bleed on the piano stem.</div>
         </>
       )}
+      {!project.options.drum_kit && project.tracks.some((t) => t.stem === "drums") && (
+        <button
+          className="btn sm"
+          onClick={async () => {
+            if (!confirm("Split the drum stem into kick, snare, hat and residual masks? These are for listening. Drum MIDI stays on the Drums track.")) return;
+            try {
+              await flushSaves().catch(() => undefined);
+              await api.reprocess(project.id, { drum_kit: true });
+              await reload();
+            } catch (e) {
+              toast("error", errorMessage(e));
+            }
+          }}
+        >
+          Split drum stem into kit pieces
+        </button>
+      )}
+      {!project.options.transcribe_mix && (
+        <button
+          className="btn sm"
+          onClick={async () => {
+            if (!confirm("Transcribe the original mix with Basic Pitch, as one extra track? This does not replace the stem MIDI.")) return;
+            try {
+              await flushSaves().catch(() => undefined);
+              await api.reprocess(project.id, { transcribe_mix: true });
+              await reload();
+            } catch (e) {
+              toast("error", errorMessage(e));
+            }
+          }}
+        >
+          Also transcribe the full mix
+        </button>
+      )}
+      {!project.options.compare_engines && (
+        <button
+          className="btn sm"
+          onClick={async () => {
+            if (!confirm("Run a second engine on bass and vocals and list disagreements? Notes are not averaged or deleted. This is slower.")) return;
+            try {
+              await flushSaves().catch(() => undefined);
+              await api.reprocess(project.id, { compare_engines: true });
+              await reload();
+            } catch (e) {
+              toast("error", errorMessage(e));
+            }
+          }}
+        >
+          Compare a second engine on bass and vocals
+        </button>
+      )}
+      {project.analysis?.meter?.time_signature && (
+        <div className="faint" style={{ fontSize: 12 }}>
+          Beat accents suggest {project.analysis.meter.time_signature} (confidence {project.analysis.meter.confidence.toFixed(2)}).
+          The grid uses the time signature in the transport until you change it.
+        </div>
+      )}
       <div className="faint" style={{ fontSize: 12 }}>
-        Edits save automatically. Use Export → Full project to keep a portable copy with all stems and edits.
+        Edits save automatically. Quantize and octave restores are undoable edits. Reset brings back the last model notes, including any marked octave correction.
       </div>
     </section>
   );

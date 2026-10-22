@@ -16,7 +16,7 @@ const TOP = 18;
 const VEL_H = 64;
 const EDGE = 6;
 const BLACK = new Set([1, 3, 6, 8, 10]);
-const DRUM_ROWS = [35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51];
+const DRUM_ROWS = [35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 54, 70];
 
 type Drag =
   | { mode: "move"; x: number; y: number; t: number; p: number; anchor: Note; base: Note[]; ids: Set<string>; moved: boolean; toggleId?: string }
@@ -563,7 +563,7 @@ function RollToolbar({ fit }: { fit: () => void }) {
       <button
         className="btn sm"
         disabled={gridStep(s.grid()) <= 0 || !notes.length}
-        title="Quantize note starts to the snap grid (Q; Shift+Q also quantizes ends)"
+        title="Quantize note starts toward the grid. This is an undoable edit. Reset restores the model timing, which is not quantized."
         onClick={() => s.edit(tid, (cur) => quantize(cur, target, s.grid(), strength / 100))}
       >
         Quantize
