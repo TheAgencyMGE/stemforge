@@ -185,6 +185,46 @@ def write_flac(path: Path, audio: np.ndarray, sr: int = TARGET_SR, subtype: str 
     sf.write(str(path), np.clip(audio.T, -1.0, 1.0), sr, format="FLAC", subtype=subtype)
 
 
+_PCM_BITS = {"PCM_16": 16, "PCM_24": 24}
+
+
+class FlacVerificationError(Exception):
+    pass
+
+
+def quantize(audio: np.ndarray, subtype: str = "PCM_24") -> np.ndarray:
+    """The integer samples libsndfile writes for (channels, n) float audio: clip, scale, round."""
+    bits = _PCM_BITS[subtype]
+    scale = float(2 ** (bits - 1))
+    q = np.round(np.clip(audio.astype(np.float64), -1.0, 1.0) * scale)
+    return np.clip(q, -scale, scale - 1).astype(np.int32)
+
+
+def write_flac_verified(path: Path, audio: np.ndarray, sr: int = TARGET_SR, subtype: str = "PCM_24") -> dict:
+    """Write FLAC, decode it again, and require the decoded PCM to equal the quantized input exactly.
+
+    FLAC is lossless, so the only change between the float waveform and the file is the documented
+    quantization to ``subtype`` (and clipping of samples outside [-1, 1], which is counted). Returns
+    facts for an export manifest: format, frames, channels, a hash of the PCM, and clip count.
+    """
+    import hashlib
+
+    write_flac(path, audio, sr, subtype)
+    want = quantize(audio, subtype)
+    info = sf.info(str(path))
+    got, got_sr = sf.read(str(path), dtype="int32", always_2d=True)
+    shift = 32 - _PCM_BITS[subtype]  # libsndfile left-justifies narrower PCM in int32
+    got = (got >> shift).T
+    if got_sr != sr or got.shape != want.shape or not np.array_equal(got, want):
+        raise FlacVerificationError(f"{path.name}: decoded PCM differs from the encoder input")
+    return {
+        "format": "FLAC", "subtype": subtype, "bit_depth": _PCM_BITS[subtype], "sample_rate": int(info.samplerate),
+        "channels": int(info.channels), "frames": int(info.frames),
+        "pcm_sha256": hashlib.sha256(np.ascontiguousarray(want.T).tobytes()).hexdigest(),
+        "clipped_samples": int(np.count_nonzero(np.abs(audio) > 1.0)), "verified": "decoded PCM == encoder input",
+    }
+
+
 def write_wav(path: Path, audio: np.ndarray, sr: int, subtype: str = "PCM_16") -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     data = audio.T if audio.ndim == 2 else audio

@@ -41,14 +41,14 @@ def _summary(i: Instrument) -> str:
     sep = {
         "isolated": f"Separated as the “{i.stem}” stem by {i.model}.",
         "shared": f"Not separated from the other sounds in the “{i.stem}” stem.",
-        "masked": "Optional spectral mask of the drum stem. Not a learned instrument model.",
+        "masked": f"Spectral mask ({i.model}). Not a learned instrument model.",
         "unavailable": "No separation model in this build produces this instrument on its own.",
     }[i.separate]
     tr = {
         "specialized": f"Transcribed with {', '.join(i.engines)} using instrument-specific settings.",
         "polyphonic": f"Transcribed with polyphonic {', '.join(i.engines)}.",
         "monophonic": f"Transcribed as one melody with {', '.join(i.engines)}.",
-        "events": "Drum hits are classified on the drum stem and written as General MIDI percussion.",
+        "events": "Hits are detected as events and written as General MIDI percussion.",
         "fallback": "Only the generic polyphonic transcriber can run, on whichever stem contains the sound.",
         "unavailable": "No transcription path is offered.",
     }[i.transcribe]
@@ -275,6 +275,78 @@ INSTRUMENTS: dict[str, Instrument] = {
               "No bagpipe model. A drone may become a long note; that is not a chanter transcription.",
               stem="other", engines=("pyin",), gm_program=109, pitch_min=50, pitch_max=84,
               model=None),
+        # Rows added for tag-based discovery. Identification is AudioSet tagging (PANNs); none of
+        # these has its own separator, so each is named only when it is what the residual holds.
+        _inst("rap_vocal", "vocals", "Rap vocal", "shared", "monophonic",
+              "Identified by tagging the vocal stem. Rhythmic speech has unstable pitch; MIDI is a rough contour.",
+              stem="vocals", engines=("pyin",), gm_program=54, pitch_min=40, pitch_max=80, model=None),
+        _inst("spoken_voice", "vocals", "Spoken voice", "shared", "monophonic",
+              "Speech in the vocal stem. Pitch transcription of speech is not a melody.",
+              stem="vocals", engines=("pyin",), gm_program=54, pitch_min=40, pitch_max=80, model=None),
+        _inst("drum_machine", "drums", "Drum machine", "shared", "events",
+              "Tagged inside the drum stem. Programmed and acoustic kits share the stem and the same NMF classes.",
+              stem="drums", engines=("drum-nmf",), gm_note=36, model=None),
+        _inst("beatbox", "vocals", "Beatbox", "shared", "unavailable",
+              "Vocal percussion stays in the vocal stem. No beatbox transcriber.", stem="vocals", model=None),
+        _inst("timpani", "percussion", "Timpani", "unavailable", "fallback",
+              "No timpani separator. Pitched, so the generic transcriber can run on the stem that holds it.",
+              stem="other", engines=("basic-pitch",), gm_program=47, pitch_min=38, pitch_max=60, model=None),
+        _inst("tabla", "percussion", "Tabla", "unavailable", "events",
+              "No tabla model. Can be isolated only as part of a percussive (HPSS) mask.",
+              stem="percussion", engines=("onset-events",), gm_note=60, model=None),
+        _inst("wood_block", "percussion", "Wood block", "masked", "events",
+              "Percussive (HPSS) mask of the residual when tags confirm it. GM 76.",
+              stem="percussion", engines=("onset-events",), gm_note=76, model="hpss"),
+        _inst("gong", "percussion", "Gong", "masked", "events",
+              "Percussive (HPSS) mask of the residual when tags confirm it. Long gong tails are partly harmonic and stay in the residual.",
+              stem="percussion", engines=("onset-events",), gm_note=52, model="hpss"),
+        _inst("bells", "percussion", "Bells / chimes", "unavailable", "fallback",
+              "Tagged only. Bell partials are inharmonic; transcribed pitches may not match the perceived note.",
+              stem="other", engines=("basic-pitch",), gm_program=14, pitch_min=60, pitch_max=108, model=None),
+        _inst("aux_percussion", "percussion", "Auxiliary percussion", "masked", "events",
+              "Percussive (HPSS) mask of the residual, kept only when its own tags confirm percussion. Not a trained separator.",
+              stem="percussion", engines=("onset-events",), gm_note=39, model="hpss"),
+        _inst("steel_guitar", "guitar", "Steel / slide guitar", "shared", "polyphonic",
+              "Shares the guitar stem (or the residual). Slides become pitch bends only on monophonic passes.",
+              stem="guitar", engines=("basic-pitch",), gm_program=25, pitch_min=40, pitch_max=88, model=None),
+        _inst("sitar", "plucked", "Sitar", "unavailable", "fallback",
+              "No sitar model. Sympathetic strings add notes a transcriber cannot attribute.",
+              stem="other", engines=("basic-pitch",), gm_program=104, pitch_min=48, pitch_max=96, model=None),
+        _inst("zither", "plucked", "Zither", "unavailable", "fallback",
+              "No zither model.", stem="other", engines=("basic-pitch",), gm_program=107,
+              pitch_min=40, pitch_max=96, model=None),
+        _inst("synthesizer", "keyboards", "Synthesizer", "unavailable", "fallback",
+              "Tagged as synthesizer; lead, pad and arpeggio roles are not distinguished by the tagger.",
+              stem="other", engines=("basic-pitch", "pyin"), gm_program=81, pitch_min=24, pitch_max=108, model=None),
+        _inst("sampler", "keyboards", "Sampler", "unavailable", "fallback",
+              "Sampled material can be anything; the tag says how it was played, not what it is.",
+              stem="other", engines=("basic-pitch",), gm_program=0, pitch_min=21, pitch_max=108, model=None),
+        _inst("steelpan", "percussion", "Steelpan", "unavailable", "fallback",
+              "No steelpan model.", stem="other", engines=("basic-pitch",), gm_program=114,
+              pitch_min=55, pitch_max=96, model=None),
+        _inst("brass_section", "brass", "Brass section", "unavailable", "fallback",
+              "Brass tagged as a section. Individual players are not separated.",
+              stem="other", engines=("basic-pitch",), gm_program=61, pitch_min=34, pitch_max=84, model=None),
+        _inst("woodwind_section", "woodwinds", "Woodwinds", "unavailable", "fallback",
+              "Woodwinds tagged as a family. Individual instruments are not separated.",
+              stem="other", engines=("basic-pitch",), gm_program=73, pitch_min=34, pitch_max=96, model=None),
+        _inst("saxophone", "woodwinds", "Saxophone", "unavailable", "fallback",
+              "AudioSet has one saxophone class; alto, tenor, soprano and baritone are not told apart.",
+              stem="other", engines=("pyin", "basic-pitch"), gm_program=65, pitch_min=36, pitch_max=88, model=None),
+        _inst("didgeridoo", "other", "Didgeridoo", "unavailable", "fallback",
+              "Drone instrument; a long low note is the expected transcription.", stem="other",
+              engines=("pyin",), gm_program=109, pitch_min=28, pitch_max=50, model=None),
+        _inst("theremin", "other", "Theremin", "unavailable", "monophonic",
+              "Continuous pitch; notes are segmented from glides and carry pitch bends.", stem="other",
+              engines=("pyin",), gm_program=81, pitch_min=36, pitch_max=96, model=None),
+        _inst("singing_bowl", "percussion", "Singing bowl", "unavailable", "fallback",
+              "No model. Sustained inharmonic tone.", stem="other", engines=("basic-pitch",),
+              gm_program=14, pitch_min=48, pitch_max=96, model=None),
+        _inst("turntable", "other", "Turntable scratching", "unavailable", "unavailable",
+              "Scratching is a texture, not notes. It is identified, not transcribed.", stem="other", model=None),
+        _inst("orchestra", "ensemble", "Orchestral ensemble", "unavailable", "fallback",
+              "A full orchestra is identified as an ensemble. Sections and players in a dense tutti cannot be separated with the bundled models.",
+              stem="other", engines=("basic-pitch",), gm_program=48, pitch_min=21, pitch_max=108, model=None),
         _inst("residual", "other", "Residual accompaniment", "isolated", "polyphonic",
               "The Other stem is whatever the separator did not assign. Notes are not labeled by instrument.",
               stem="other", engines=("basic-pitch", "pyin"), gm_program=48, pitch_min=21, pitch_max=108,
@@ -331,7 +403,8 @@ EXCLUDED_MODELS: list[dict[str, str]] = [
 ]
 
 FAMILY_ORDER = [
-    "vocals", "drums", "bass", "guitar", "keyboards", "strings", "brass", "woodwinds", "plucked", "other",
+    "vocals", "drums", "percussion", "bass", "guitar", "keyboards", "strings", "brass", "woodwinds", "plucked",
+    "ensemble", "other",
 ]
 
 # Pitch bounds used when reviewing a stem. Notes outside the span are flagged, never deleted.
@@ -347,9 +420,9 @@ STEM_PITCH_RANGE: dict[str, tuple[int, int]] = {
 STEM_BLURB: dict[str, str] = {
     "vocals": "Vocal stem from HTDemucs. pYIN transcribes one melody. Mixed singers are not separated.",
     "drums": "Whole kit from HTDemucs. NMF labels kick, snare and hi-hat; open hat, pedal hat, crash, tom and clap are spectral relabels when the hit does not match the coarse template.",
-    "bass": "Bass stem from HTDemucs. Not split into electric, upright or synth. Octave corrections keep the original pitch on the note.",
-    "guitar": "Guitar stem from htdemucs_6s only. One stem, not a rhythm/lead split. Tablature is a standard-tuning estimate.",
-    "piano": "Piano stem from htdemucs_6s. Upstream reports heavy bleed. Transcription is polyphonic Basic Pitch, not a piano-only model.",
+    "bass": "Bass stem from HTDemucs. Electric, upright and synth bass share this one stem; the track name comes from instrument tags, not from a separate model. Octave corrections keep the original pitch on the note.",
+    "guitar": "Guitar extracted from the residual with htdemucs_6s ratio masks, kept because its own tags confirm guitar. One source, not a rhythm/lead split. Tablature is a standard-tuning estimate.",
+    "piano": "Piano extracted from the residual with htdemucs_6s ratio masks, kept because its own tags confirm keys. Upstream reports bleed on the 6-stem piano. Transcription is polyphonic Basic Pitch, not a piano-only model.",
     "other": "Residual stem. Instruments here are not identified. Basic Pitch transcribes pitches; it does not name the source.",
     "mix": "Original mix, not a stem. Basic Pitch puts every instrument it hears on one track.",
     "kit_kick": "NMF mask of the drum stem for listening. Sample-aligned. Hits stay on the Drums MIDI track.",
@@ -394,8 +467,8 @@ def validate_registry() -> None:
                 raise ValueError(f"{inst.id} claims an isolated stem {inst.stem}")
             if inst.model not in {"htdemucs", "htdemucs_6s"}:
                 raise ValueError(f"{inst.id} isolated stem is not an HTDemucs source")
-        if inst.separate == "masked" and inst.model != "drum-nmf":
-            raise ValueError(f"{inst.id} mask is not the drum NMF")
+        if inst.separate == "masked" and inst.model not in {"drum-nmf", "hpss"}:
+            raise ValueError(f"{inst.id} mask is not the drum NMF or the HPSS percussion mask")
         if inst.transcribe == "unavailable" and inst.engines:
             raise ValueError(f"{inst.id} lists engines but cannot transcribe")
         if inst.gm_note is not None and not 0 <= inst.gm_note <= 127:

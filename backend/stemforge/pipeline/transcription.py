@@ -34,6 +34,7 @@ class EngineSpec:
     polyphonic: bool
     description: str
     defaults: dict[str, Any] = field(default_factory=dict)
+    external: bool = False  # runs in its own environment (pipeline/external.py)
 
 
 ENGINES: dict[str, EngineSpec] = {
@@ -54,7 +55,59 @@ ENGINES: dict[str, EngineSpec] = {
         "No learned drum model is loaded.",
         {"onset_threshold": 0.5, "min_note_ms": 40},
     ),
+    "onset-events": EngineSpec(
+        "onset-events", "Onset events (one percussion voice)", True,
+        "Spectral-flux onsets of a single unpitched percussion source, written as one General MIDI "
+        "percussion note chosen from the source's identity. No classification between hits.",
+        {"onset_threshold": 0.5, "min_note_ms": 60, "gm_note": 39},
+    ),
+    "transkun": EngineSpec(
+        "transkun", "Transkun (piano, research engine)", True,
+        "Semi-CRF piano transcription with predicted velocities (Yan & Duan). Runs in its own environment. "
+        "Code MIT; checkpoint licence not stated. On BabySlakh piano stems it scored note F1 0.94 vs 0.75 for "
+        "Basic Pitch (docs/EVALUATION.md).",
+        {"min_note_ms": 10}, external=True,
+    ),
+    "yourmt3": EngineSpec(
+        "yourmt3", "YourMT3+ (multi-instrument, research engine)", True,
+        "YourMT3+ YPTF.MoE+Multi in its own environment. Code GPL-3.0 (separate program), checkpoint "
+        "Apache-2.0 per its card. On BabySlakh, transcribing the whole mix and assigning notes to the separated "
+        "sources scored all-notes F1 0.88 vs 0.41 for Basic Pitch per source (docs/EVALUATION.md). No velocity "
+        "or per-note confidence: velocity comes from the source's loudness.",
+        {"min_note_ms": 10, "input": "stem"}, external=True,
+    ),
+    "muscriptor": EngineSpec(
+        "muscriptor", "MuScriptor (multi-instrument, research engine)", True,
+        "Kyutai/Mirelo transformer transcription, conditioned on the instrument discovery found. Weights CC BY-NC "
+        "4.0, gated on Hugging Face; non-commercial research only. No velocity output: velocity comes from the "
+        "stem's loudness.",
+        {"min_note_ms": 10, "instruments": ""}, external=True,
+    ),
 }
+
+
+def allowed_engines(stem: str, is_drum: bool) -> list[str]:
+    """Engines that make sense for a track, in preference order, limited to installed ones."""
+    if stem == "percussion":
+        wanted = ["onset-events"]
+    elif stem == "drums":
+        wanted = ["drum-nmf", "muscriptor"]
+    elif is_drum:
+        wanted = ["drum-nmf"]
+    else:
+        wanted = ["basic-pitch", "pyin", "transkun", "yourmt3", "muscriptor"]
+    return [e for e in wanted if engine_available(e)]
+
+
+def engine_available(engine: str) -> bool:
+    spec = ENGINES.get(engine)
+    if spec is None:
+        return False
+    if not spec.external:
+        return True
+    from .external import interpreter
+
+    return interpreter(engine) is not None
 
 STEM_POLICY: dict[str, tuple[str, dict[str, Any], str]] = {
     "vocals": ("pyin", {"min_freq": 70.0, "max_freq": 1100.0},
@@ -68,6 +121,9 @@ STEM_POLICY: dict[str, tuple[str, dict[str, Any], str]] = {
               "kick, snare and hi-hat hits. Open hat, pedal hat, crash, toms, side-stick and clap are "
               "relabels of those hits when the spectrum is clearly different, not extra neural classes. "
               "Tambourine and shaker are not detected."),
+    "percussion": ("onset-events", {},
+                   "Auxiliary percussion (tambourine, shaker, wood block...) found in the residual. Each hit "
+                   "is one event on the GM note of the identified instrument."),
     "mix": ("basic-pitch", {},
             "Direct polyphonic transcription of the original mix. Notes from every instrument share one "
             "track. This is a comparison with the stem transcription, not a replacement for it."),
@@ -84,6 +140,21 @@ GM_PROGRAM = {"vocals": 53, "bass": 33, "piano": 0, "guitar": 25, "other": 48, "
 
 def choose_engine(stem: str) -> tuple[str, dict[str, Any], str]:
     engine, overrides, reason = STEM_POLICY.get(stem, STEM_POLICY["other"])
+    from ..config import get_settings
+
+    # Research engines enter the default policy only where a benchmark supports it, and only when
+    # the operator opted in (their licences are non-commercial or unstated).
+    research = get_settings().research_engines
+    if research and stem in ("piano", "guitar", "other") and engine_available("yourmt3"):
+        return ("yourmt3", {**ENGINES["yourmt3"].defaults, "input": "mix"},
+                "Research engines on: YourMT3+ transcribes the whole mix and each note goes to the separated source "
+                "that plays it. On 20 BabySlakh songs this beat Basic Pitch per source on keyboards (F1 0.48 vs 0.31), "
+                "guitar (0.46 vs 0.27) and note ends (0.78 vs 0.15). Bass stays on Basic Pitch, which scored higher "
+                "there (0.61 vs 0.52).")
+    if research and stem == "piano" and engine_available("transkun"):
+        return ("transkun", dict(ENGINES["transkun"].defaults),
+                "Research engines on: Transkun scored F1 0.97 vs 0.75 for Basic Pitch on true BabySlakh piano stems "
+                "and 0.43 vs 0.34 on separated piano sources, with predicted velocity.")
     params = {**ENGINES[engine].defaults, **overrides}
     return engine, params, reason
 
@@ -315,6 +386,67 @@ def drum_notes(feats: dict[str, np.ndarray], params: dict[str, Any]) -> list[dic
 # ---------------------------------------------------------------- facade
 
 
+def onset_event_notes(feats: dict[str, np.ndarray], params: dict[str, Any]) -> list[dict]:
+    """Peak-picked onsets of one percussion voice. Confidence is the onset's prominence over the
+    adaptive threshold, as for the drum engine."""
+    import librosa
+
+    env, rms, fps = feats["env"], feats["rms"], float(feats["fps"][0])
+    if env.size < 8:
+        return []
+    nov = env / (float(np.percentile(env, 99)) + 1e-9)
+    delta = 0.05 + 0.4 * params["onset_threshold"]
+    wait = max(1, int(params["min_note_ms"] / 1000 * fps))
+    peaks = librosa.util.peak_pick(nov, pre_max=3, post_max=3, pre_avg=20, post_avg=5, delta=delta, wait=wait)
+    top = float(np.percentile(rms, 99)) + 1e-9
+    pitch = int(np.clip(round(float(params.get("gm_note") or 39)), 27, 87))
+    notes = []
+    for p in peaks:
+        thr = float(np.mean(nov[max(0, p - 20): p + 6])) + delta
+        conf = float(np.clip((nov[p] - thr) / max(float(nov[p]), 1e-9) * 1.5, 0.0, 1.0))
+        level = float(rms[min(len(rms) - 1, p): p + 4].max()) / top if len(rms) else 0.5
+        t = p / fps
+        notes.append({
+            "id": _nid(), "pitch": pitch, "start": round(t, 4), "end": round(t + 0.06, 4),
+            "velocity": int(np.clip(round(30 + 97 * min(level, 1.0)), 1, 127)),
+            "confidence": round(conf, 3), "bends": None,
+        })
+    return notes
+
+
+_EXT_FIELDS = ("pitch", "start", "end", "velocity", "program")
+
+
+def _external_features(engine: str, audio: np.ndarray, sr: int, params: dict[str, Any]) -> dict[str, np.ndarray]:
+    """Run an external engine once and cache its notes as arrays (no pickles in the cache)."""
+    from . import external
+
+    if engine == "transkun":
+        notes = external.transkun_notes(audio, sr)
+    elif engine == "yourmt3":
+        notes = [n for n in external.yourmt3_notes(audio, sr) if not n["is_drum"]]
+    else:
+        groups = [g for g in str(params.get("instruments") or "").split(",") if g] or None
+        notes = external.muscriptor_notes(audio, sr, groups)
+    out = {k: np.array([float(v) if (v := n.get(k)) is not None else -1.0 for n in notes], dtype=np.float64)
+           for k in _EXT_FIELDS}
+    out["is_drum"] = np.array([bool(n.get("is_drum")) for n in notes])
+    return out
+
+
+def _external_notes(feats: dict[str, np.ndarray], params: dict[str, Any]) -> list[dict]:
+    min_len = float(params.get("min_note_ms") or 0) / 1000
+    notes = []
+    for i in range(len(feats["pitch"])):
+        start, end = float(feats["start"][i]), float(feats["end"][i])
+        if end - start < min_len:
+            continue
+        notes.append({"id": _nid(), "pitch": int(feats["pitch"][i]), "start": round(start, 4), "end": round(end, 4),
+                      "velocity": int(np.clip(round(float(feats["velocity"][i])), 1, 127)), "confidence": None,
+                      "bends": None, "flags": ["no_model_confidence"]})
+    return notes
+
+
 def compute_features(engine: str, audio: np.ndarray, sr: int, params: dict[str, Any]) -> dict[str, np.ndarray]:
     """The expensive, threshold-independent part of each engine (cached as an artifact)."""
     import librosa
@@ -326,6 +458,14 @@ def compute_features(engine: str, audio: np.ndarray, sr: int, params: dict[str, 
         return pyin_track(y, params)
     if engine == "drum-nmf":
         return drum_features(audio, sr)
+    if ENGINES[engine].external:
+        return _external_features(engine, audio, sr, params)
+    if engine == "onset-events":
+        y = librosa.resample(to_mono(audio), orig_sr=sr, target_sr=SR, res_type="soxr_hq")
+        env = librosa.onset.onset_strength(y=y, sr=SR, hop_length=256)
+        level = librosa.feature.rms(y=y, frame_length=1024, hop_length=256)[0]
+        return {"env": env.astype(np.float32), "rms": level.astype(np.float32),
+                "fps": np.array([SR / 256], dtype=np.float64)}
     raise ValueError(f"unknown engine {engine}")
 
 
@@ -337,6 +477,10 @@ def notes_from_features(engine: str, feats: dict[str, np.ndarray], audio: np.nda
         from .drums import refine_drum_notes
 
         return refine_drum_notes(drum_notes(feats, params), audio, sr, params)
+    if engine == "onset-events":
+        return onset_event_notes(feats, params)
+    if ENGINES[engine].external:
+        return _external_notes(feats, params)
     y = librosa.resample(to_mono(audio), orig_sr=sr, target_sr=SR, res_type="soxr_hq")
     if engine == "basic-pitch":
         return basic_pitch_notes(feats, y, params)
@@ -349,15 +493,20 @@ def feature_key_params(engine: str, params: dict[str, Any]) -> dict[str, Any]:
     """Parameters that change the cached features (others only change post-processing)."""
     if engine == "pyin":
         return {"min_freq": params.get("min_freq"), "max_freq": params.get("max_freq")}
+    if engine == "muscriptor":
+        return {"instruments": params.get("instruments") or ""}
+    if engine == "yourmt3":
+        return {"input": params.get("input") or "stem"}
     return {}
 
 
 def summarize(notes: list[dict], low_conf: float = 0.4) -> dict[str, Any]:
     if not notes:
         return {"count": 0, "mean_confidence": None, "low_confidence": 0}
-    conf = np.array([n["confidence"] for n in notes])
+    known = [n["confidence"] for n in notes if n.get("confidence") is not None]
+    conf = np.array(known, dtype=float)
     return {
-        "count": len(notes), "mean_confidence": round(float(conf.mean()), 3),
+        "count": len(notes), "mean_confidence": round(float(conf.mean()), 3) if known else None,
         "low_confidence": int((conf < low_conf).sum()),
         "pitch_range": [int(min(n["pitch"] for n in notes)), int(max(n["pitch"] for n in notes))],
     }

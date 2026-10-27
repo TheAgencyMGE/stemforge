@@ -22,7 +22,7 @@ def upload(client, path, name=None, **params):
 def test_health_and_system(client):
     assert client.get("/api/healthz").json()["status"] == "ok"
     sysinfo = client.get("/api/system").json()
-    assert {e["id"] for e in sysinfo["engines"]} == {"basic-pitch", "pyin", "drum-nmf"}
+    assert {e["id"] for e in sysinfo["engines"]} == {"basic-pitch", "pyin", "drum-nmf", "onset-events"}
     assert "wav" in sysinfo["formats"]
     assert client.get("/api/openapi.json").status_code == 200
 
@@ -104,7 +104,7 @@ def test_instrument_catalog_and_upload_options(client, tmp_path):
     assert catalog.status_code == 200
     ids = {row["id"] for family in catalog.json()["families"] for row in family["instruments"]}
     assert "violin" in ids and "lead_vocal" in ids
-    missing = client.get("/api/instruments/theremin")
+    missing = client.get("/api/instruments/not_an_instrument")
     assert missing.status_code == 404 and missing.json()["error"]["code"] == "unknown_instrument"
     violin = client.get("/api/instruments/violin").json()
     assert violin["separate"] == "unavailable" and violin["model"] is None
@@ -141,14 +141,20 @@ def test_full_pipeline_demo_song(client, tmp_path):
     assert p["job"]["status"] == "succeeded"
     assert set(p["job"]["stages"]) == {"decode", "analyze", "separate", "render", "transcribe", "midi"}
     tracks = {t["stem"]: t for t in p["tracks"]}
-    assert set(tracks) == {"vocals", "drums", "bass", "other"}
+    # The synthetic demo has no voice: no vocals track may be created at all, not even a silent one.
+    # With the tagger installed the keys are also extracted as piano; without it they stay in "other".
+    assert {"drums", "bass"} <= set(tracks) <= {"drums", "bass", "piano", "other"}
+    assert "vocals" not in tracks
     assert tracks["drums"]["engine"] == "drum-nmf" and tracks["drums"]["note_count"] > 50
     assert tracks["bass"]["note_count"] > 40
-    # The synthetic demo has no voice: the vocal stem must be reported silent, not hallucinated.
-    assert tracks["vocals"]["transcription_status"] == "skipped" and tracks["vocals"]["note_count"] == 0
+    checks = [e for e in p["analysis"]["discovery"]["log"] if e["step"] == "family_check"]
+    assert next(e for e in checks if e["stem"] == "vocals")["accepted"] is False
+    for t in tracks.values():
+        assert t["stats"]["source"]["activity"]["active_seconds"] > 0.75
     kinds = {(a["kind"], a["stem"]) for a in p["artifacts"]}
-    for s in ["drums", "bass", "other", "vocals"]:
+    for s in tracks:
         assert ("stem", s) in kinds and ("preview", s) in kinds and ("peaks", s) in kinds
+    assert ("stem", "vocals") not in kinds
     assert ("midi_combined", None) in kinds
 
     # Signed download of a stem works and is the full-length 44.1 kHz audio.
@@ -180,8 +186,8 @@ def test_full_pipeline_demo_song(client, tmp_path):
     assert any(n.pitch == 100 for n in pm.instruments[0].notes)
 
     multi = pretty_midi.PrettyMIDI(io.BytesIO(client.get(f"/api/projects/{pid}/export/midi").content))
-    assert {i.name for i in multi.instruments} == {"Drums", "Bass", "Other"}
-    assert next(i for i in multi.instruments if i.name == "Drums").is_drum
+    assert {i.name for i in multi.instruments} == {t["display_name"] for t in tracks.values()}
+    assert next(i for i in multi.instruments if i.name == tracks["drums"]["display_name"]).is_drum
 
     # Re-transcribe one track with a different engine (cached features path for the second run).
     rt = client.post(f"/api/projects/{pid}/tracks/{bass['id']}/transcribe", json={"engine": "pyin", "params": {"min_freq": 30, "max_freq": 500}})
@@ -199,7 +205,7 @@ def test_full_pipeline_demo_song(client, tmp_path):
     restored = client.post("/api/projects/import", content=bundle.content)
     assert restored.status_code == 201, restored.text
     rp = restored.json()
-    assert rp["status"] == "ready" and len(rp["tracks"]) == 4
+    assert rp["status"] == "ready" and len(rp["tracks"]) == len(tracks)
     rbass = next(t for t in rp["tracks"] if t["stem"] == "bass")
     assert rbass["note_count"] == t2["note_count"]
     assert any(a["kind"] == "preview" for a in rp["artifacts"])

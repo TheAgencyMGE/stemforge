@@ -27,14 +27,64 @@ upload ─► validate (magic bytes; header probe via libsndfile, or PyAV/ffmpeg
        ─► decode → 44.1 kHz float32 stereo master (+ optional trim window)
        ─► analyze  : duration, peak/clipping, tempo + beat grid, key (Krumhansl–Schmuckler),
                      sections (chroma/MFCC agglomerative segmentation)
-       ─► separate : htdemucs (vocals, drums, bass, other)   [+ htdemucs_6s → guitar, piano]
-                     residual check: |mix − Σ stems| reported as separation leakage metric
-       ─► transcribe (per stem, engine chosen by policy below)
+       ─► separate : htdemucs (vocals, drums, bass, other); mixture DC split once across sources;
+                     stems zeroed wherever the input mixture is digitally silent
+       ─► discover : per candidate: activity vs the mix + PANNs tags on the candidate itself
+                     reject absent families (no track); reassign their bleed by tag similarity
+                     residual loop: htdemucs_6s ratio masks (guitar/piano) and HPSS (percussion)
+                     only when tags justify them, kept only if the target's own tags confirm it
+                     name the residual (single / group / unresolved); reconstruction check
+       ─► transcribe (per source, engine chosen by policy below; raw notes stored)
+       ─► refine   : bass octave check, split-sustain merge (needs no-attack evidence),
+                     cross-source bleed attribution (needs a ≥1.5× louder copy elsewhere)
        ─► MIDI     : per-stem SMF + combined multitrack SMF (tempo map from analysis),
                      re-parsed with symusic for validation
        ─► artifacts: stems (FLAC 24-bit), lossless 16-bit FLAC previews (no MP3/Opus encoder delay,
                      so nothing is silently shifted), peaks JSON, constant-Q pitch spectrogram PNG
 ```
+
+### Source discovery (`pipeline/discovery.py`)
+
+There is no fixed stem list. Tracks are the sources the evidence supports:
+
+| Decision | Evidence | Result when it fails |
+|---|---|---|
+| A broad family (vocals, drums, bass) is present | Active ≥ 0.75 s at a median level above −30 dB relative to the mix, **and** the stem's own tags for that family ≥ 0.15. Drums and bass may also pass on strong, sustained energy (AudioSet's bass class is weak on isolated bass). Vocals always need tag evidence, because vocal stems are where instrument bleed collects. | No track. The stem's audio is added to the accepted source whose tag profile it matches (cosine ≥ 0.6), else kept as a hidden internal residual. |
+| Try a targeted extraction on the residual | Residual tags for guitar/piano (or percussion) ≥ 0.08 | Not attempted. |
+| Keep the extraction | Target active, **and** its own tags ≥ 0.2; for percussion also that the residual's percussion evidence dropped | Its audio stays in the residual. |
+| Name the residual | One instrument ≥ 0.12 and 2× the runner-up → that name. Several → a group label ("Strings + Brass"). None → "Unresolved source" for review. | — |
+
+Extractions are soft masks of their parent, so target + complement equals the parent exactly and no audio is invented or lost. The loop stops when no extractor is justified, when the residual is 35 dB below the mix, or after 4 iterations. Without the tagger the same pipeline runs on energy alone, stricter, and says so. Thresholds are in `Thresholds` and were set on the fixtures in `docs/EVALUATION.md`.
+
+### Optional research engines (`pipeline/external.py`)
+
+Transkun, YourMT3+ and MuScriptor run as separate programs in their own virtualenvs (licences
+and dependency stacks stay out of the main install). Stemforge writes a WAV, runs the engine and
+reads notes back (MIDI or JSON); `transcription.ENGINES` marks them `external`, and the feature
+cache stores their notes as plain arrays (no pickles). `allowed_engines(stem, is_drum)` is the one
+place that decides which engines a track accepts; the API, the worker and the inspector all use it,
+and engines that are not installed are never offered. Mix-level transcription (YourMT3+) is assigned
+to separated sources by `pipeline/attribution.py` (constant-Q energy at the note's pitch, with an
+`attribution_uncertain` flag). See RECONSTRUCTION.md.
+
+### MIDI timing (`pipeline/midi.py`)
+
+`TimeMap` converts seconds to ticks. The default is one tempo (the project's, or an integer for the
+Soundtrap package); optionally a tempo change on every detected beat. Notes are stored in seconds, so
+either way they land where they were played; the writer and the validator share the conversion.
+
+### Render fidelity (`pipeline/render.py`)
+
+With FluidSynth and a soundfont configured, each track's MIDI is rendered with its GM program and
+compared with its own stem (chroma similarity, onset-envelope correlation, log-mel distance). The
+render is stored (`midi_render`) and the numbers go into the track's stats.
+
+### Exports (`exports.py`)
+
+* **Default selection:** every audible source. Unresolved sources are included (they are real audio and needed to rebuild the mix) and marked `"status": "unresolved"` in the manifest. Silent tracks, drum-kit masks and the full-mix transcription are opt-in.
+* **Synchronized:** every file is the full project length (DAW at 0:00 lines up). **Trimmed:** leading and trailing silence removed with a −60 dBFS peak threshold, a 20 ms pre-roll and a 250 ms release hold (reverb tails stay); internal silence is never cut. `export_manifest.json` records each file's start/end on the original file's timeline, frames, format and a PCM hash.
+* **Lossless check:** every FLAC is decoded after writing and must equal the quantized samples bit for bit. The manifest keeps four properties apart: lossless encoding, separation accuracy, mix reconstruction, MIDI fidelity.
+* **Mute:** a mixer state. It selects what goes into a rendered mix; it never alters or deletes a stored stem.
 
 Every stage writes its output to storage and records an `Artifact` row. A retried or resumed job therefore **skips stages whose artifacts already exist** and still match the job's parameter hash.
 
@@ -45,6 +95,7 @@ Every stage writes its output to storage and records an `Artifact` row. A retrie
 | vocals | `pyin-melody`: pYIN f0 → note segmentation, plus pitch bends from the f0 contour | Vocals are mostly monophonic. pYIN gives a calibrated voiced probability, which we use directly as per-note confidence. Basic Pitch over-splits vibrato. |
 | bass | `basic-pitch` band-limited to 30–500 Hz, onset 0.6; `pyin` one click away | Planned as pYIN. Measurement reversed it: Basic Pitch F1 0.91 vs pYIN 0.79, because pYIN merges repeated same-pitch notes. pYIN remains better for legato lines. |
 | piano, guitar, other | `basic-pitch` (ONNX) | Polyphonic transcription is required. Confidence is the mean note activation. |
+| percussion (aux) | `onset-events` | One unpitched voice found in the residual: spectral-flux onsets on the GM note of its identity (tambourine 54, shaker 70, ...). |
 | drums | `drum-nmf`: semi-adaptive NMF with kick, snare and hi-hat templates (GM 36/38/42). A hit is relabeled open hat, pedal hat, crash, tom, side-stick or clap only when its spectrum disagrees with that template. | No permissively licensed neural drum model exists (ADTOF is CC BY-NC-SA). A band-flux prototype over-triggered (F1 0.49–0.72). NMF separates simultaneous hits (F1 1.0 on the fixture for the three coarse classes). |
 
 The user can override the engine per track and re-run transcription only for that track, using sensitivity (onset/frame thresholds) and a minimum note length. Separation is not re-run.
@@ -89,7 +140,7 @@ The piano roll shades notes by confidence. Notes below a user-set threshold are 
 
 ## 5. Known limitations (honest)
 
-* Separation quality is bounded by HTDemucs. Reverb tails and dense mixes bleed between stems.
+* Separation quality is bounded by HTDemucs. Reverb tails and dense mixes bleed between stems. Instrument families without a permissively licensed separator (strings, brass, woodwinds, synths) are identified but not split from each other.
 * Six-stem piano is unreliable upstream. Guitar is usable.
 * Polyphonic transcription of distorted guitar or dense synths is ambiguous and will show low confidence.
 * Drum transcription starts from kick, snare, and hi-hat templates. Open hat, pedal hat, crash, tom, side-stick and clap are spectral relabels, not a neural model. Ride, tambourine and shaker are not detected. Optional kit audio is an NMF mask of the drum stem, not a new separator.

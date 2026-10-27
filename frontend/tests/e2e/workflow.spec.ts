@@ -22,20 +22,27 @@ test("upload → process → edit → export with real inference", async ({ page
 
   const project = await (await request.get(`/api/projects/${projectId}`)).json();
   expect(project.status).toBe("ready");
-  expect(project.tracks.map((t: { stem: string }) => t.stem).sort()).toEqual(["bass", "drums", "other", "vocals"]);
+  // The demo is instrumental: discovery must not create a vocal track. Names depend on the
+  // evidence (e.g. "Synth bass" with the tagger installed, "Bass" without it), so read them.
+  type T = { stem: string; display_name: string; id: string };
+  const stems = project.tracks.map((t: T) => t.stem);
+  expect(stems).not.toContain("vocals");
+  expect(stems).toEqual(expect.arrayContaining(["drums", "bass"]));
+  const bass = project.tracks.find((t: T) => t.stem === "bass") as T;
+  const drums = project.tracks.find((t: T) => t.stem === "drums") as T;
 
-  // Track lanes with mixer controls.
-  for (const name of ["Original mix", "Vocals", "Drums", "Bass", "Other"]) {
+  // Track lanes with mixer controls, one per detected source.
+  for (const name of ["Original mix", ...project.tracks.map((t: T) => t.display_name)]) {
     await expect(page.getByRole("listitem").filter({ hasText: name }).first()).toBeVisible();
   }
-  await page.getByRole("button", { name: "Solo Bass" }).click();
-  await expect(page.getByRole("button", { name: "Solo Bass" })).toHaveAttribute("aria-pressed", "true");
-  await page.getByRole("button", { name: "Solo Bass" }).click();
+  const solo = page.getByRole("button", { name: `Solo ${bass.display_name}`, exact: true });
+  await solo.click();
+  await expect(solo).toHaveAttribute("aria-pressed", "true");
+  await solo.click();
 
-  // Edit: select Bass, add a note by double-clicking empty space high in the roll.
-  await page.getByRole("listitem").filter({ hasText: "Bass" }).locator(".lname").click();
-  await expect(page.getByRole("toolbar", { name: "Note editing tools" })).toContainText("Bass");
-  const bass = project.tracks.find((t: { stem: string }) => t.stem === "bass");
+  // Edit: select the bass, add a note by double-clicking empty space high in the roll.
+  await page.getByRole("listitem").filter({ hasText: bass.display_name }).first().locator(".lname").click();
+  await expect(page.getByRole("toolbar", { name: "Note editing tools" })).toContainText(bass.display_name);
   const before = (await (await request.get(`/api/projects/${projectId}/tracks/${bass.id}/notes`)).json()).notes.length;
   const roll = page.getByRole("application");
   const box = (await roll.boundingBox())!;
@@ -61,9 +68,9 @@ test("upload → process → edit → export with real inference", async ({ page
   const file = await download.path();
   const midi = new Midi(fs.readFileSync(file!));
   const names = midi.tracks.map((t) => t.name).filter(Boolean);
-  expect(names).toEqual(expect.arrayContaining(["Drums", "Bass", "Other"]));
-  expect(midi.tracks.find((t) => t.name === "Drums")!.channel).toBe(9);
-  expect(midi.tracks.find((t) => t.name === "Bass")!.notes.length).toBe(before);
+  expect(names).toEqual(expect.arrayContaining(project.tracks.map((t: T) => t.display_name)));
+  expect(midi.tracks.find((t) => t.name === drums.display_name)!.channel).toBe(9);
+  expect(midi.tracks.find((t) => t.name === bass.display_name)!.notes.length).toBe(before);
   expect(midi.header.tempos[0].bpm).toBeGreaterThan(90);
 
   // Clean up

@@ -11,6 +11,24 @@ const ENGINE_LABEL: Record<EngineId, string> = {
   "basic-pitch": "Basic Pitch (polyphonic)",
   pyin: "pYIN (monophonic melody)",
   "drum-nmf": "Drum NMF (kit classes)",
+  "onset-events": "Onset events (one percussion voice)",
+  transkun: "Transkun (piano, research engine)",
+  yourmt3: "YourMT3+ (multi-instrument, research engine)",
+  muscriptor: "MuScriptor (multi-instrument, research engine)",
+};
+
+const RESEARCH_NOTE: Partial<Record<EngineId, string>> = {
+  transkun: "Runs in its own environment. Code MIT; the checkpoint has no stated licence. No per-note confidence.",
+  yourmt3: "Runs in its own environment. Code GPL-3.0, checkpoint Apache-2.0 per its card. Chosen automatically, it transcribes the whole mix and keeps the notes this source plays. No velocity output (taken from the stem's loudness) and no per-note confidence.",
+  muscriptor: "Runs in its own environment. Weights CC BY-NC 4.0: non-commercial research only. No velocity output (taken from the stem's loudness) and no per-note confidence.",
+};
+
+const ISOLATION_LABEL: Record<string, string> = {
+  broad: "Separated directly by the source-separation model",
+  targeted: "Extracted from a parent stem by a targeted split (target + complement = parent)",
+  residual: "What remained after every supported extraction; it holds one identified instrument",
+  group: "Several instruments that no bundled model can separate from each other",
+  unresolved: "Audible but not identified with confidence",
 };
 
 const PARAM_META: Record<string, { label: string; min: number; max: number; step: number; help: string }> = {
@@ -37,7 +55,8 @@ function TrackInspector({ track }: { track: Track }) {
   const edit = useEditor((s) => s.edit);
   const toast = useEditor((s) => s.toast);
   const confThreshold = useEditor((s) => s.confThreshold);
-  const allowed: EngineId[] = track.is_drum ? ["drum-nmf"] : ["basic-pitch", "pyin"];
+  const fallback: EngineId[] = track.stem === "percussion" ? ["onset-events"] : track.is_drum ? ["drum-nmf"] : ["basic-pitch", "pyin"];
+  const allowed: EngineId[] = track.allowed_engines?.length ? track.allowed_engines : fallback;
   const [engine, setEngine] = useState<EngineId>((track.engine as EngineId) ?? allowed[0]);
   const [params, setParams] = useState<Record<string, number | null>>({ ...track.engine_params });
   const [job, setJob] = useState<Job | null>(null);
@@ -112,13 +131,15 @@ function TrackInspector({ track }: { track: Track }) {
           }}
         />
         <dl className="kv">
-          <dt>Separated by</dt><dd>{track.source_model.replace("demucs:", "")}</dd>
+          <dt>Separated by</dt><dd>{track.source_model.replace(/^demucs:/, "")}</dd>
           <dt>Level vs mix</dt><dd>{track.stats.relative_db != null ? `${track.stats.relative_db} dB` : "–"}</dd>
           <dt>Peak</dt><dd>{track.stats.peak_db} dBFS</dd>
           {summary?.count != null && <><dt>Notes (model)</dt><dd>{summary.count}</dd></>}
           {summary?.mean_confidence != null && <><dt>Mean confidence</dt><dd>{summary.mean_confidence.toFixed(2)}</dd></>}
           <dt>Below threshold</dt><dd>{lowCount}</dd>
         </dl>
+        {track.stats.source && <SourceEvidence source={track.stats.source} />}
+        {track.stats.render_fidelity && <RenderFidelity track={track} />}
         {track.warnings.map((w) => <div key={w} className="warnbox">{w}</div>)}
         {summary?.suggestions?.map((s) => (
           <div key={s.code} className={s.severity === "info" ? "reason" : "warnbox"}>
@@ -142,8 +163,9 @@ function TrackInspector({ track }: { track: Track }) {
             <label className="field">
               Engine
               <select value={engine} onChange={(e) => chooseEngine(e.target.value as EngineId)} disabled={allowed.length < 2}>
-                {allowed.map((id) => <option key={id} value={id}>{ENGINE_LABEL[id]}</option>)}
+                {allowed.map((id) => <option key={id} value={id}>{ENGINE_LABEL[id] ?? id}</option>)}
               </select>
+              {RESEARCH_NOTE[engine] && <div className="faint" style={{ fontSize: 12 }}>{RESEARCH_NOTE[engine]}</div>}
             </label>
             {Object.entries(PARAM_META).map(([k, m]) =>
               params[k] === undefined ? null : (
@@ -229,7 +251,22 @@ function TrackInspector({ track }: { track: Track }) {
         <h3>Download</h3>
         <div className="row wrap">
           {stemArtifact && (
-            <a className="btn sm" href={stemArtifact.url} download={stemArtifact.filename}>Stem (FLAC 24-bit)</a>
+            <>
+              <button
+                className="btn sm"
+                title="Leading and trailing silence removed. The original-timeline start is in the file's response header and in zip exports' manifest."
+                onClick={async () => {
+                  try {
+                    await downloadFromApi(`/projects/${project.id}/tracks/${track.id}/audio?mode=trimmed`, `${track.stem}-trimmed.flac`);
+                  } catch (e) {
+                    toast("error", errorMessage(e));
+                  }
+                }}
+              >
+                FLAC (trimmed)
+              </button>
+              <a className="btn sm" href={stemArtifact.url} download={stemArtifact.filename} title="Full length, sample-aligned with every other stem and the original file.">FLAC (full timeline)</a>
+            </>
           )}
           {track.transcription_status === "done" && (
             <button
@@ -249,6 +286,92 @@ function TrackInspector({ track }: { track: Track }) {
         </div>
       </section>
     </>
+  );
+}
+
+const STEP_TEXT: Record<string, (e: Record<string, unknown>) => string | null> = {
+  family_check: (e) => e.accepted ? null
+    : `${String(e.stem)}: not present. ${e.family_score == null ? "Energy" : `Tag evidence ${Math.round(Number(e.family_score) * 100)}%`}, audible ${Number((e.activity as { active_seconds?: number })?.active_seconds ?? 0).toFixed(1)} s.`,
+  targeted: (e) => e.error ? `${String(e.model)}: could not run (${String(e.error)}).`
+    : `${String(e.target)} via ${String(e.model)}: ${e.accepted ? "extracted" : "tried, not kept"} (own tag ${Math.round(Number(e.target_tag) * 100)}%).`,
+  reassign: (e) => `${String(e.from)} stem held only bleed (${String(e.rel_db)} dB); merged into ${String(e.to)}.`,
+  internal_residual: (e) => `${String(e.from)} stem: ${String(e.reason)} (${String(e.rel_db)} dB); kept out of the track list.`,
+  residual_stop: (e) => `Stopped: ${String(e.reason)}.`,
+};
+
+function DiscoverySummary() {
+  const { project } = useWorkspace();
+  const d = project.analysis?.discovery;
+  if (!d) return null;
+  const residual = project.artifacts.find((a) => a.kind === "residual");
+  const lines = d.log.map((e) => STEP_TEXT[e.step]?.(e as Record<string, unknown>)).filter((x): x is string => !!x);
+  return (
+    <details className="card" style={{ padding: "6px 10px" }}>
+      <summary style={{ cursor: "pointer", fontSize: 13 }}>
+        Source discovery · {project.tracks.filter((t) => t.stats.source).length} sources · mix rebuilt to {d.reconstruction.residual_db} dB
+      </summary>
+      <div className="faint" style={{ fontSize: 12, marginTop: 6 }}>
+        Tagger: {d.tagger === "unavailable" ? "not installed (energy-only decisions)" : d.tagger}. Each line is a decision and the evidence behind it.
+      </div>
+      <ul style={{ fontSize: 12, margin: "6px 0 0 16px", padding: 0 }}>
+        {lines.map((l, i) => <li key={i}>{l}</li>)}
+      </ul>
+      {residual && (
+        <a className="btn sm" style={{ marginTop: 6 }} href={residual.url} download={residual.filename}
+          title="Audio that no source could be credited with on the evidence (for example harmonics that leaked into the residual). It is not a track, but nothing is thrown away.">
+          Unattributed residual (FLAC, {d.reconstruction.internal_residual_db} dB)
+        </a>
+      )}
+    </details>
+  );
+}
+
+function RenderFidelity({ track }: { track: Track }) {
+  const { project } = useWorkspace();
+  const f = track.stats.render_fidelity!;
+  const render = project.artifacts.find((a) => a.kind === "midi_render" && a.stem === track.stem);
+  const pct = (v: number | null) => (v == null ? "–" : `${Math.round(v * 100)}%`);
+  return (
+    <div className="reason" style={{ marginBottom: 8 }}>
+      <strong style={{ color: "var(--text)" }}>MIDI vs this stem</strong>
+      <dl className="kv" style={{ marginTop: 6 }}>
+        <dt title="Pitch classes and harmony, largely independent of the instrument sound">Pitch content match</dt><dd>{pct(f.chroma_similarity)}</dd>
+        <dt title="Correlation of note attacks over time">Rhythm match</dt><dd>{pct(f.onset_correlation)}</dd>
+        <dt title="Overall spectral difference, including timbre, effects and mix">Sound difference</dt><dd>{f.logmel_l1_db == null ? "–" : `${f.logmel_l1_db} dB`}</dd>
+      </dl>
+      <div className="faint" style={{ fontSize: 12 }}>
+        The MIDI was rendered through a General MIDI soundfont and compared with this separated stem, bleed included. It says how closely the MIDI
+        reproduces the stem, not how accurate the transcription is: on the BabySlakh benchmark these numbers did not reliably pick the more accurate engine.
+        The sound difference also includes the instrument sound, which no MIDI file carries.
+      </div>
+      {render && <audio controls preload="none" src={render.url} style={{ width: "100%", marginTop: 6 }} aria-label="MIDI rendered through the soundfont" />}
+    </div>
+  );
+}
+
+function SourceEvidence({ source }: { source: NonNullable<Track["stats"]["source"]> }) {
+  const a = source.activity;
+  return (
+    <div className="reason" style={{ marginBottom: 8 }}>
+      <strong style={{ color: "var(--text)" }}>
+        {source.status === "unresolved" ? "Unresolved source" : source.display}
+      </strong>
+      <dl className="kv" style={{ marginTop: 6 }}>
+        <dt>Identity evidence</dt>
+        <dd>{source.confidence == null ? "energy only (tagger not installed)" : `${Math.round(source.confidence * 100)}% tag probability`}</dd>
+        <dt>Isolation</dt><dd title={ISOLATION_LABEL[source.isolation]}>{source.isolation}</dd>
+        <dt>Audible</dt>
+        <dd>{a.active_seconds.toFixed(1)} s{a.first_active != null ? ` (from ${a.first_active.toFixed(1)} s)` : ""}</dd>
+        {a.median_active_rel_db != null && <><dt>Level when playing</dt><dd>{a.median_active_rel_db} dB vs mix</dd></>}
+        <dt>Audio from</dt><dd>{source.separation}</dd>
+      </dl>
+      <div className="faint" style={{ fontSize: 12 }}>{ISOLATION_LABEL[source.isolation]}.</div>
+      {source.candidates.length > 0 && (
+        <div className="faint" style={{ fontSize: 12, marginTop: 4 }}>
+          Tag candidates: {source.candidates.slice(0, 4).map((c) => `${c.name} ${Math.round(c.score * 100)}%`).join(", ")}
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -274,15 +397,17 @@ function ProjectSection() {
   const { project, reload } = useWorkspace();
   const toast = useEditor((s) => s.toast);
   const has6 = project.tracks.some((t) => t.stem === "guitar" || t.stem === "piano");
+  const tried6 = project.options.six_stem || (project.analysis?.discovery?.log ?? []).some((e) => e.step === "targeted" && e.model === "htdemucs_6s");
   return (
     <section>
       <h3>Project</h3>
-      {!has6 && (
+      <DiscoverySummary />
+      {!has6 && !tried6 && (
         <>
           <button
             className="btn sm"
             onClick={async () => {
-              if (!confirm("Run htdemucs_6s to add guitar and piano stems? The existing vocals/drums/bass are reused; the 'Other' stem is replaced by the 6-stem residual and re-transcribed.")) return;
+              if (!confirm("Force a guitar/piano extraction pass with htdemucs_6s? Discovery skipped it because the tags did not indicate guitar or piano. A part is only kept if its own tags confirm it.")) return;
               try {
                 await flushSaves().catch(() => undefined);
                 await api.reprocess(project.id, { six_stem: true });
@@ -292,7 +417,7 @@ function ProjectSection() {
               }
             }}
           >
-            Add guitar + piano stems
+            Try guitar / piano extraction anyway
           </button>
           <div className="faint" style={{ fontSize: 12 }}>Experimental: upstream reports heavy bleed on the piano stem.</div>
         </>

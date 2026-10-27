@@ -27,7 +27,7 @@ def test_registry_does_not_invent_separators():
 
 
 def test_unknown_instrument_is_absent():
-    assert instruments.get_instrument("theremin") is None
+    assert instruments.get_instrument("not_an_instrument") is None
     assert instruments.stem_blurb("kit_kick").startswith("NMF mask")
 
 

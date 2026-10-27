@@ -213,8 +213,8 @@ export function UploadPanel({ system }: { system: SystemInfo | null }) {
           <label className="check">
             <input type="checkbox" checked={sixStem} onChange={(e) => setSixStem(e.target.checked)} />
             <span>
-              Also separate guitar and piano (htdemucs_6s)
-              <span className="faint"> · experimental: upstream notes the piano stem bleeds noticeably</span>
+              Always try guitar and piano extraction (htdemucs_6s)
+              <span className="faint"> · it already runs automatically when guitar or piano is heard; a part is kept only if its own tags confirm it</span>
             </span>
           </label>
           <details>

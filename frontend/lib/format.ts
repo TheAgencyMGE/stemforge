@@ -51,6 +51,18 @@ export const STEM_COLOR: Record<string, string> = {
   kit_perc: "var(--stem-drums)",
 };
 
+/** Lane colour for any source, including discovered ones: by stem first, then by instrument family. */
+const FAMILY_STEM: Record<string, string> = {
+  vocals: "vocals", drums: "drums", percussion: "drums", bass: "bass", guitar: "guitar", plucked: "guitar",
+  keyboards: "piano", strings: "other", brass: "other", woodwinds: "other", ensemble: "other",
+};
+
+export function stemKey(track: { stem: string; stats?: { source?: { family?: string } } } | null | undefined): string {
+  if (!track) return "other";
+  if (track.stem in STEM_HEX) return track.stem;
+  return FAMILY_STEM[track.stats?.source?.family ?? ""] ?? "other";
+}
+
 /** Hex versions for canvas drawing (CSS variables are not resolvable inside canvas). */
 export const STEM_HEX: Record<string, string> = {
   vocals: "#f2c14e",

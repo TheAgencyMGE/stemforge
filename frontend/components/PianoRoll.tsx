@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { setupCanvas, useCanvasSize } from "./TrackLanes";
 import { useWorkspace } from "./Workspace";
-import { STEM_HEX, STEM_COLOR } from "@/lib/format";
+import { STEM_HEX, STEM_COLOR, stemKey } from "@/lib/format";
 import {
   DRUM_NAMES, deleteNotes, gridStep, insertNote, moveNotes, notesInRect, pitchName, quantize, resizeNotes,
   secondsPerBeat, setVelocity, snapTime, snapToScale, transpose, MIN_NOTE,
@@ -43,7 +43,7 @@ export function PianoRoll() {
   const hover = useRef<{ t: number; p: number } | null>(null);
   const [, force] = useState(0);
   const isDrum = !!track?.is_drum;
-  const color = STEM_HEX[track?.stem ?? "other"] ?? "#4fd1c5";
+  const color = STEM_HEX[stemKey(track)] ?? "#4fd1c5";
 
   const noteAreaH = Math.max(40, size.h - TOP - VEL_H - 6);
 
@@ -554,7 +554,7 @@ function RollToolbar({ fit }: { fit: () => void }) {
 
   return (
     <div className="roll-toolbar" role="toolbar" aria-label="Note editing tools">
-      <span className="chip" style={{ borderColor: STEM_COLOR[track.stem], color: STEM_COLOR[track.stem] }}>{track.display_name}</span>
+      <span className="chip" style={{ borderColor: STEM_COLOR[stemKey(track)], color: STEM_COLOR[stemKey(track)] }}>{track.display_name}</span>
       <span className="faint num" style={{ fontSize: 12 }}>{notes.length} notes · {scope}</span>
       <span style={{ width: 8 }} />
       <button className="btn sm" aria-pressed={s.tool === "select"} onClick={() => s.set({ tool: "select" })} title="Select / move tool (V)">Select</button>

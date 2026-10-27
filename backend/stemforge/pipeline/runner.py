@@ -21,11 +21,12 @@ from ..config import get_settings
 from ..models import Artifact, Job, Project, Track, utcnow
 from ..storage import Storage, sha256_file
 from . import analysis, audio, midi, transcription
+from .discovery import DISCOVERY_VERSION, discover
 from .drums import piece_audio
-from .instruments import stem_blurb
+from .instruments import get_instrument, stem_blurb
+from .refine import CROSS_SOURCE_RATIO, comparison_engine, cross_source_duplicates, engine_disagreements
 from .refine import apply as refine_notes
-from .refine import comparison_engine, engine_disagreements
-from .separation import DemucsSeparator, residual_db
+from .separation import DemucsSeparator, gate_mixture_silence
 
 log = logging.getLogger(__name__)
 
@@ -243,59 +244,20 @@ def _run_process(ctx: JobContext) -> None:
         msg = f"Tempo {result.get('tempo') or '–'} BPM, key {(result.get('key') or {}).get('label', '–')}"
         ctx.end("analyze", message=msg)
 
-    # ---- separate
-    six = bool(opts.get("six_stem"))
-    base_model = settings.demucs_model
-    h_sep = phash({"master": h_master, "model": base_model, "six": six, "shifts": settings.demucs_shifts})
-    stems: dict[str, np.ndarray] = {}
-    stem_models: dict[str, str] = {}
-    ctx.begin("separate", f"Separating with {base_model}" + (" + htdemucs_6s" if six else ""))
-    wanted = ["vocals", "drums", "bass", "other"] + (["guitar", "piano"] if six else [])
-    existing = {s: ctx.find_artifact("stem", s, h_sep) for s in wanted}
-    if all(existing.values()):
-        for s, art in existing.items():
-            stems[s] = ctx.read_audio(art)  # type: ignore[arg-type]
-            stem_models[s] = (art.meta or {}).get("model", base_model)  # type: ignore[union-attr]
-        reused_stems = True
-    else:
-        reused_stems = False
-        try:
-            sep4 = DemucsSeparator(base_model)
-        except Exception as exc:
-            raise PermanentError(f"separation model unavailable: {exc}") from exc
-        share = 0.6 if six else 1.0
-        out4 = sep4.separate(mix, audio.TARGET_SR,
-                             lambda f: ctx.progress("separate", f * share, f"{base_model}: {f * 100:.0f}%"))
-        for s in ["vocals", "drums", "bass", "other"]:
-            stems[s], stem_models[s] = out4[s], sep4.name
-        if six:
-            try:
-                sep6 = DemucsSeparator("htdemucs_6s")
-            except Exception as exc:
-                raise PermanentError(f"6-stem model unavailable: {exc}") from exc
-            out6 = sep6.separate(mix, audio.TARGET_SR,
-                                 lambda f: ctx.progress("separate", 0.6 + 0.4 * f, f"htdemucs_6s: {f * 100:.0f}%"))
-            # Vocals/drums/bass from the stronger 4-stem model; guitar, piano and the remaining
-            # "other" from the 6-stem model so the stems still (approximately) sum to the mix.
-            for s in ["guitar", "piano", "other"]:
-                stems[s], stem_models[s] = out6[s], sep6.name
-        for s in wanted:
-            local = ctx.tmp / f"{s}.flac"
-            audio.write_flac(local, stems[s], subtype="PCM_24")
-            ctx.save_artifact("stem", s, local, ctx.key("stems", f"{s}.flac"), f"{_slug(p.name)}-{s}.flac",
-                              "audio/flac", h_sep, {"model": stem_models[s]})
-    resid = residual_db(mix, {s: stems[s] for s in wanted if s in stems})
+    # ---- separate + discover which sources are really there
+    stems, stem_models, source_meta, h_sep, resid, reused_stems = _separate_and_discover(ctx, mix, h_master, opts)
     _maybe_drum_kit(ctx, stems, stem_models, h_sep, opts)
     if opts.get("transcribe_mix"):
         stems["mix"] = mix
         stem_models["mix"] = "basic-pitch:full-mix"
+    shown = [s for s in source_meta]
     if reused_stems:
         ctx.end("separate", "skipped", "Reused stems from a previous attempt", residual_db=resid)
     else:
-        ctx.end("separate", message=f"{len(wanted)} stems", residual_db=resid)
+        ctx.end("separate", message=f"{len(shown)} sources found", residual_db=resid)
 
     # ---- tracks + render (previews, peaks, spectrograms)
-    _upsert_tracks(ctx, stems, stem_models, resid, audio.level_stats(mix)["rms_db"])
+    _upsert_tracks(ctx, stems, stem_models, resid, audio.level_stats(mix)["rms_db"], source_meta)
     ctx.begin("render", "Rendering waveforms and spectrograms")
     renders = [("original", mix)] + [(s, stems[s]) for s in _ordered(stems)]
     for i, (name, data) in enumerate(renders):
@@ -330,10 +292,17 @@ def _run_process(ctx: JobContext) -> None:
             tr.engine_reason = "Listening mask of the drum stem. Hits are transcribed on the Drums track."
         elif tr.engine is None:
             eng, params, reason = transcription.choose_engine(tr.stem)
+            identity = ((tr.stats or {}).get("source") or {}).get("identity")
+            inst = get_instrument(identity) if identity else None
+            if eng == "onset-events" and inst is not None and inst.gm_note is not None:
+                params = {**params, "gm_note": inst.gm_note}
+            if inst is not None:
+                reason = f"{reason} Source identified as {inst.name}."
             tr.engine, tr.engine_params, tr.engine_reason = eng, params, reason
         label = f"Transcribing {tr.display_name} ({tr.engine})"
         _transcribe_track(ctx, tr, stems[tr.stem], h_sep, preserve_edits=True,
                           frac=lambda f, i=i, label=label: ctx.progress("transcribe", (i + f) / len(tracks), label))
+    _attribute_duplicates(ctx)
     ctx.end("transcribe")
 
     # ---- midi
@@ -347,7 +316,107 @@ def _run_process(ctx: JobContext) -> None:
 
 
 def _ordered(stems: dict[str, Any]) -> list[str]:
-    return [s for s in STEM_ORDER if s in stems]
+    """Known stems in their usual order, then any discovered source ids alphabetically."""
+    known = [s for s in STEM_ORDER if s in stems]
+    return known + sorted(s for s in stems if s not in STEM_ORDER)
+
+
+def _separate_and_discover(ctx: JobContext, mix: np.ndarray, h_master: str, opts: dict[str, Any]):
+    """Broad separation, then evidence-based discovery of the sources that are actually present.
+
+    Returns (stems, stem_models, source_meta, h_sep, mixture residual dB, reused). Only sources the
+    evidence supports are returned; rejected stems never become tracks (see discovery.py).
+    """
+    from . import tagger
+
+    settings = get_settings()
+    base_model = settings.demucs_model
+    six = bool(opts.get("six_stem"))
+    h_sep = phash({"master": h_master, "model": base_model, "six": six, "shifts": settings.demucs_shifts,
+                   "discovery": DISCOVERY_VERSION, "tagger": tagger.available(), "gate": 1})
+    ctx.begin("separate", f"Separating with {base_model} and listening for instruments")
+    disc_art = ctx.find_artifact("discovery", None, h_sep)
+    if disc_art is not None:
+        with ctx.storage.open(disc_art.storage_key) as f:
+            summary = json.loads(f.read())
+        found = {src["stem"]: ctx.find_artifact("stem", src["stem"], h_sep) for src in summary["sources"]}
+        if all(found.values()):
+            cached = {name: ctx.read_audio(art) for name, art in found.items()}  # type: ignore[arg-type]
+            cached_models = {name: (art.meta or {}).get("model", base_model)  # type: ignore[union-attr]
+                             for name, art in found.items()}
+            _store_discovery(ctx, summary)
+            return cached, cached_models, {src["stem"]: src for src in summary["sources"]}, h_sep, summary["reconstruction"]["residual_db"], True
+
+    separators: dict[str, DemucsSeparator] = {}
+
+    def run(model: str, audio_in: np.ndarray, cb) -> dict[str, np.ndarray]:
+        try:
+            if model not in separators:
+                separators[model] = DemucsSeparator(model)
+        except Exception as exc:
+            if model == base_model:
+                raise PermanentError(f"separation model unavailable: {exc}") from exc
+            raise
+        out = separators[model].separate(audio_in, audio.TARGET_SR, cb)
+        return gate_mixture_silence(audio_in, out, audio.TARGET_SR)
+
+    base = run(base_model, mix, lambda f: ctx.progress("separate", 0.5 * f, f"{base_model}: {f * 100:.0f}%"))
+    result = discover(
+        mix, audio.TARGET_SR, base, base_model, run,
+        lambda f, msg: ctx.progress("separate", 0.5 + 0.48 * f, msg), opts,
+    )
+    summary = result.summary()
+    stems: dict[str, np.ndarray] = {}
+    models: dict[str, str] = {}
+    meta: dict[str, dict[str, Any]] = {}
+    for src_meta in summary["sources"]:
+        name = src_meta["stem"]
+        stems[name] = result.sources[name].audio
+        models[name] = src_meta.get("separation") or base_model
+        meta[name] = src_meta
+        local = ctx.tmp / f"{name}.flac"
+        flac = audio.write_flac_verified(local, stems[name], subtype="PCM_24")
+        ctx.save_artifact("stem", name, local, ctx.key("stems", f"{name}.flac"),
+                          f"{_slug(ctx.project.name)}-{name}.flac", "audio/flac", h_sep,
+                          {"model": models[name], "status": src_meta["status"], "flac": flac})
+    if result.internal_residual is not None:
+        # Kept for reconstruction checks and explicit download; never a track.
+        local = ctx.tmp / "internal_residual.flac"
+        audio.write_flac(local, result.internal_residual, subtype="PCM_24")
+        ctx.save_artifact("residual", None, local, ctx.key("stems", "internal_residual.flac"),
+                          f"{_slug(ctx.project.name)}-internal-residual.flac", "audio/flac", h_sep,
+                          {"rel_db": summary["reconstruction"].get("internal_residual_db")})
+    _delete_stale_stems(ctx, set(stems))
+    local = ctx.tmp / "discovery.json"
+    local.write_text(json.dumps(summary, default=float))
+    ctx.save_artifact("discovery", None, local, ctx.key("discovery.json"), "discovery.json",
+                      "application/json", h_sep)
+    _store_discovery(ctx, summary)
+    return stems, models, meta, h_sep, summary["reconstruction"]["residual_db"], False
+
+
+def _store_discovery(ctx: JobContext, summary: dict[str, Any]) -> None:
+    analysis_doc = dict(ctx.project.analysis or {})
+    analysis_doc["discovery"] = {k: summary[k] for k in ("version", "tagger", "log", "reconstruction")}
+    ctx.project.analysis = analysis_doc
+    ctx.db.commit()
+
+
+def _delete_stale_stems(ctx: JobContext, keep: set[str]) -> None:
+    """Remove artifacts of sources a previous run produced but this run does not support."""
+    kinds = ["stem", "preview", "peaks", "spectrogram", "midi", "features"]
+    q = select(Artifact).where(Artifact.project_id == ctx.project.id, Artifact.kind.in_(kinds))
+    for art in ctx.db.scalars(q):
+        stem = art.stem or ""
+        base = stem.split("__", 1)[0]
+        if not stem or stem == "original" or stem.startswith("kit_") or stem == "mix" or base in keep:
+            continue
+        try:
+            ctx.storage.delete_prefix(art.storage_key)
+        except Exception:  # noqa: BLE001 - best effort
+            log.warning("could not delete stale artifact", extra={"key": art.storage_key})
+        ctx.db.delete(art)
+    ctx.db.commit()
 
 
 def _slug(name: str) -> str:
@@ -357,10 +426,13 @@ def _slug(name: str) -> str:
 
 
 def _upsert_tracks(ctx: JobContext, stems: dict[str, np.ndarray], models: dict[str, str], resid: float,
-                   mix_rms_db: float) -> None:
+                   mix_rms_db: float, source_meta: dict[str, dict[str, Any]] | None = None) -> None:
     from ..model_registry import manifest
 
+    source_meta = source_meta or {}
+
     existing = {t.stem: t for t in ctx.db.scalars(select(Track).where(Track.project_id == ctx.project.id))}
+    used_names: dict[str, int] = {}
     for idx, s in enumerate(_ordered(stems)):
         stats = audio.level_stats(stems[s])
         stats["relative_db"] = round(stats["rms_db"] - mix_rms_db, 2)
@@ -369,8 +441,23 @@ def _upsert_tracks(ctx: JobContext, stems: dict[str, np.ndarray], models: dict[s
         warnings = []
         if "6s" in models[s] and s == "piano":
             warnings.append(manifest()["htdemucs_6s"]["caveat"])
-        if s == "other":
-            warnings.append("Residual stem: may contain several instruments; transcription can be ambiguous.")
+        meta = source_meta.get(s)
+        if meta is not None:
+            # Discovery already established that this source is audible; the old global-RMS
+            # silence rule would only re-litigate that with less evidence.
+            stats["silent"] = False
+            stats["source"] = {k: v for k, v in meta.items() if not k.startswith("_")}
+            if meta.get("status") == "unresolved":
+                cands = ", ".join(c["name"] for c in meta.get("candidates", [])[:3]) or "no candidate above noise"
+                warnings.append(f"Unresolved source: audible content that no tag identifies with confidence "
+                                f"(closest: {cands}). Kept for review and for a complete reconstruction.")
+            elif meta.get("isolation") == "group":
+                warnings.append("Several instruments are audible in this track and no bundled model separates "
+                                "them from each other: " + ", ".join(c["name"] for c in meta.get("contains", [])))
+            for absorbed in meta.get("absorbed", []):
+                warnings.append(f"Includes bleed reassigned from the {absorbed['from']} stem, which had no "
+                                f"part of its own ({absorbed['rel_db']} dB).")
+            warnings.extend(meta.get("limitations", [])[:2])
         if stats["silent"]:
             warnings.append(f"Stem is effectively silent ({stats['rms_db']} dBFS RMS, "
                             f"{stats['relative_db']} dB below the mix); transcription skipped.")
@@ -380,7 +467,10 @@ def _upsert_tracks(ctx: JobContext, stems: dict[str, np.ndarray], models: dict[s
         if stats["clipped_ratio"] > 0.001:
             warnings.append("Stem has clipped samples; separation output exceeded full scale.")
         blurb = stem_blurb(s)
-        if blurb:
+        # The generic residual blurb ("instruments here are not identified") is only true when
+        # discovery could not name the source.
+        if blurb and not (meta is not None and s == "other" and meta.get("status") == "accepted"
+                          and meta.get("kind") != "unresolved"):
             warnings.insert(0, blurb)
         tr = existing.get(s)
         # Edits only survive a re-run if the stem audio came from the same model.
@@ -388,15 +478,28 @@ def _upsert_tracks(ctx: JobContext, stems: dict[str, np.ndarray], models: dict[s
         tr = tr or Track(project_id=ctx.project.id, stem=s)
         if tr not in ctx.db:
             ctx.db.add(tr)
-        tr.display_name = tr.display_name or STEM_LABEL.get(s, s.title())
+        inst = get_instrument(meta["identity"]) if meta and meta.get("identity") else None
+        if inst is None and meta and meta.get("contains"):
+            # A group or unresolved source: use its strongest identified member for the GM program.
+            inst = get_instrument(meta["contains"][0]["id"])
+        if meta is not None:
+            name = meta.get("display") or STEM_LABEL.get(s, s.title())
+            used_names[name] = used_names.get(name, 0) + 1
+            tr.display_name = name if used_names[name] == 1 else f"{name} {used_names[name]}"
+        else:
+            tr.display_name = tr.display_name or STEM_LABEL.get(s, s.title())
         tr.order_index = idx
         tr.source_model = models[s]
-        tr.is_drum = s == "drums" or s.startswith("kit_")
-        tr.gm_program = transcription.GM_PROGRAM.get(s, 0)
+        tr.is_drum = s in {"drums", "percussion"} or s.startswith("kit_")
+        if inst is not None and inst.gm_program is not None:
+            tr.gm_program = inst.gm_program
+        else:
+            tr.gm_program = transcription.GM_PROGRAM.get(s, 0)
         tr.stats = stats
         tr.warnings = warnings
     for stem, old in existing.items():
-        if stem not in stems and (stem.startswith("kit_") or stem == "mix"):
+        # A source this run did not find is not kept as an empty track.
+        if stem not in stems:
             ctx.db.delete(old)
     ctx.db.commit()
 
@@ -447,7 +550,22 @@ def _transcribe_track(ctx: JobContext, tr: Track, data: np.ndarray, h_sep: str, 
         return
     engine = tr.engine or transcription.choose_engine(tr.stem)[0]
     params = transcription.resolve_params(engine, tr.engine_params)
+    if engine == "muscriptor" and not params.get("instruments"):
+        # Condition MuScriptor on what discovery identified, the model's own documented option.
+        from .external import REGISTRY_TO_MUSCRIPTOR
+
+        identity = ((tr.stats or {}).get("source") or {}).get("identity")
+        groups = REGISTRY_TO_MUSCRIPTOR.get(identity or "", [])
+        if tr.stem == "drums":
+            groups = ["drums"]
+        params["instruments"] = ",".join(groups)
     notes = _notes_for_engine(ctx, tr.stem, engine, params, data, h_sep, tr.stem)
+    # Raw model output is kept next to the refined notes so every correction stays reviewable.
+    local = ctx.tmp / f"{tr.stem}.raw.json"
+    local.write_text(json.dumps({"engine": engine, "params": params, "notes": notes}))
+    ctx.save_artifact("notes_raw", tr.stem, local, ctx.key("notes", f"{tr.stem}-raw.json"),
+                      f"{_slug(ctx.project.name)}-{tr.stem}-raw-notes.json", "application/json", h_sep,
+                      {"engine": engine, "count": len(notes)})
     frac(0.7)
     refined = refine_notes(tr.stem, engine, notes, data, audio.TARGET_SR)
     suggestions = list(refined.suggestions)
@@ -476,8 +594,79 @@ def _transcribe_track(ctx: JobContext, tr: Track, data: np.ndarray, h_sep: str, 
     frac(1.0)
 
 
+def _mix_attributed_notes(ctx: JobContext, stem: str, h_sep: str, params: dict[str, Any]) -> list[dict]:
+    """YourMT3+ on the whole mix (once per separation), each note assigned to the pitched source that
+    plays it (attribution.py), with velocity from that source's loudness. Cached on the context."""
+    import librosa
+
+    from .attribution import attribute_notes
+
+    cache = getattr(ctx, "_mix_attribution", None)
+    if cache is None or cache[0] != h_sep:
+        master = ctx.db.scalars(select(Artifact).where(Artifact.project_id == ctx.project.id,
+                                                       Artifact.kind == "master")).first()
+        if master is None:
+            raise PermanentError("decoded audio missing; re-run processing")
+        mix = ctx.read_audio(master)
+        mix_notes = _notes_for_engine(ctx, "mix", "yourmt3", {**params, "input": "stem"}, mix, h_sep, "mix__yourmt3")
+        sources: dict[str, np.ndarray] = {}
+        for t in ctx.db.scalars(select(Track).where(Track.project_id == ctx.project.id)):
+            if t.is_drum or t.stem == "mix" or t.stem.startswith("kit_"):
+                continue
+            art = ctx.find_artifact("stem", t.stem, h_sep)
+            if art is not None:
+                sources[t.stem] = ctx.read_audio(art)
+        assigned = attribute_notes(mix_notes, sources, audio.TARGET_SR)
+        for name, notes in assigned.items():
+            y = librosa.resample(audio.to_mono(sources[name]), orig_sr=audio.TARGET_SR, target_sr=22050)
+            curve = transcription._velocity_curve(y, 22050)
+            for n in notes:
+                n["velocity"] = curve(float(n["start"]), float(n["end"]))
+        cache = (h_sep, assigned)
+        ctx._mix_attribution = cache  # type: ignore[attr-defined]
+    return [dict(n) for n in cache[1].get(stem, [])]
+
+
+def _attribute_duplicates(ctx: JobContext) -> None:
+    """Remove bleed copies: a note that a clearly louder pitched source also has (refine.py).
+
+    Only unedited tracks change, the removed notes are listed in the track's review notes, and the
+    raw model notes stay in the notes_raw artifact.
+    """
+    tracks = [t for t in ctx.db.scalars(select(Track).where(Track.project_id == ctx.project.id))
+              if t.transcription_status == "done" and not t.is_drum and t.stem != "mix"]
+    if len(tracks) < 2:
+        return
+    dupes = cross_source_duplicates({t.stem: list(t.generated_notes or []) for t in tracks})
+    for t in tracks:
+        ids = set(dupes.get(t.stem, []))
+        if not ids:
+            continue
+        unedited = (t.notes or []) == (t.generated_notes or [])
+        removed = [n for n in t.generated_notes or [] if n["id"] in ids]
+        t.generated_notes = [n for n in t.generated_notes or [] if n["id"] not in ids]
+        if unedited:
+            t.notes = list(t.generated_notes)
+            t.notes_version += 1
+        detail = json.loads(t.transcription_detail or "{}") if (t.transcription_detail or "").startswith("{") else {}
+        others = sorted({o.display_name for o in tracks if o is not t})
+        detail.setdefault("suggestions", []).append({
+            "code": "cross_source_bleed",
+            "severity": "info",
+            "message": (f"{len(removed)} notes were bleed copies of notes that {', '.join(others)} plays at least "
+                        f"{CROSS_SOURCE_RATIO:.1f}x louder at the same pitch and onset, and were attributed there. "
+                        "The raw model notes are kept with the track."),
+            "note_ids": [],
+        })
+        detail["count"] = len(t.generated_notes)
+        t.transcription_detail = json.dumps(detail)
+    ctx.db.commit()
+
+
 def _notes_for_engine(ctx: JobContext, stem: str, engine: str, params: dict[str, Any], data: np.ndarray,
                       h_sep: str, feature_stem: str) -> list[dict]:
+    if engine == "yourmt3" and params.get("input") == "mix":
+        return _mix_attributed_notes(ctx, stem, h_sep, params)
     h_feat = phash({"sep": h_sep, "stem": stem, "engine": engine,
                     "fp": transcription.feature_key_params(engine, params), "v": 1})
     art = ctx.find_artifact("features", feature_stem, h_feat)
@@ -513,6 +702,42 @@ def _write_midi(ctx: JobContext) -> None:
     report = midi.save_and_validate(mf, local, specs, bpm, p.offset_seconds)
     ctx.save_artifact("midi_combined", None, local, ctx.key("midi", "combined.mid"),
                       f"{_slug(p.name)}-multitrack.mid", "audio/midi", "", report)
+    _render_fidelity(ctx, with_notes, bpm)
+
+
+def _render_fidelity(ctx: JobContext, tracks: list[Track], bpm: float) -> None:
+    """Render each track's MIDI through the configured General MIDI soundfont and measure it against
+    the track's own stem (render.compare). Skipped when no renderer is configured."""
+    from . import render
+
+    if render.renderer() is None:
+        return
+    for t in tracks:
+        stem_art = ctx.find_artifact("stem", t.stem, _latest_hash(ctx, "stem", t.stem))
+        if stem_art is None or not t.notes:
+            continue
+        stem_audio = ctx.read_audio(stem_art)
+        local = ctx.tmp / f"{t.stem}.render.mid"
+        spec = [midi.MidiTrackSpec(t.display_name, t.notes, t.gm_program, t.is_drum)]
+        midi.build_midi(spec, bpm).save(str(local))  # processed-region timeline, like the stem
+        try:
+            rendered = render.render_midi(local, audio.TARGET_SR, stem_audio.shape[1] / audio.TARGET_SR)
+        except render.RenderError as exc:
+            log.warning("MIDI render failed", extra={"stem": t.stem, "error": str(exc)})
+            continue
+        out = ctx.tmp / f"{t.stem}.render.flac"
+        audio.write_flac(out, rendered, subtype="PCM_16")
+        ctx.save_artifact("midi_render", t.stem, out, ctx.key("render", f"{t.stem}.flac"),
+                          f"{_slug(ctx.project.name)}-{t.stem}-midi-render.flac", "audio/flac", phash(t.notes_version),
+                          {"soundfont": Path(get_settings().soundfont_path).name, "gm_program": t.gm_program})
+        t.stats = {**(t.stats or {}), "render_fidelity": render.compare(rendered, stem_audio, audio.TARGET_SR)}
+    ctx.db.commit()
+
+
+def _latest_hash(ctx: JobContext, kind: str, stem: str) -> str:
+    art = ctx.db.scalars(select(Artifact).where(Artifact.project_id == ctx.project.id, Artifact.kind == kind,
+                                                Artifact.stem == stem).order_by(Artifact.created_at.desc())).first()
+    return art.params_hash if art is not None else ""
 
 
 # ============================================================================ retranscribe
@@ -524,10 +749,8 @@ def _run_retranscribe(ctx: JobContext) -> None:
     if tr is None or tr.project_id != ctx.project.id:
         raise PermanentError("track not found")
     engine = params.get("engine") or tr.engine
-    if engine not in transcription.ENGINES:
-        raise PermanentError(f"unknown engine {engine}")
-    if engine == "drum-nmf" and not tr.is_drum:
-        raise PermanentError("the drum engine only applies to the drum stem")
+    if engine not in transcription.allowed_engines(tr.stem, tr.is_drum):
+        raise PermanentError(f"engine {engine} is not available for this track")
     stem_art = ctx.db.scalars(select(Artifact).where(Artifact.project_id == ctx.project.id,
                                                      Artifact.kind == "stem", Artifact.stem == tr.stem)).first()
     if stem_art is None:
@@ -541,6 +764,7 @@ def _run_retranscribe(ctx: JobContext) -> None:
     # A re-transcription replaces edits on this track: that is what the user asked for.
     _transcribe_track(ctx, tr, data, stem_art.params_hash, preserve_edits=False,
                       frac=lambda f: ctx.progress("transcribe", f))
+    _attribute_duplicates(ctx)
     ctx.end("transcribe")
     ctx.begin("midi", "Writing and validating MIDI")
     _write_midi(ctx)

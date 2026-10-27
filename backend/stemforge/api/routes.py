@@ -8,7 +8,7 @@ import shutil
 import tempfile
 import uuid
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal
 from urllib.parse import unquote
 
 from fastapi import APIRouter, BackgroundTasks, Depends, Query, Request
@@ -18,13 +18,13 @@ from pydantic import BaseModel, Field
 from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session
 
-from .. import __version__, queue, services
+from .. import __version__, exports, queue, services
 from ..config import get_settings
 from ..db import get_db
 from ..models import Artifact, Job, Project, Track
 from ..pipeline import audio as audio_mod
 from ..pipeline.instruments import EXCLUDED_MODELS, families, get_instrument
-from ..pipeline.transcription import ENGINES
+from ..pipeline.transcription import ENGINES, allowed_engines, engine_available
 from ..schemas import (
     EngineOut,
     InstrumentCatalog,
@@ -121,7 +121,8 @@ def system(db: DB) -> SystemInfo:
         version=__version__, device=device, device_name=name,
         models=[ModelStatus(**status(n)) for n in manifest()],
         engines=[EngineOut(id=e.id, label=e.label, polyphonic=e.polyphonic, description=e.description,
-                           defaults=e.defaults) for e in ENGINES.values()],
+                           defaults=e.defaults, external=e.external)
+                 for e in ENGINES.values() if engine_available(e.id)],
         formats=NATIVE_FORMATS + (["m4a", "webm"] if m4a else []), m4a_supported=m4a,
         max_upload_mb=settings.max_upload_mb, max_duration_seconds=settings.max_duration_seconds,
         retention_days=settings.retention_days, auth_required=bool(settings.api_token),
@@ -467,10 +468,10 @@ def retranscribe(project_id: str, track_id: str, body: RetranscribeIn, db: DB) -
     if _active_job(db, project_id):
         raise ApiError(409, "busy", "wait for the current job on this project to finish")
     engine = body.engine or t.engine
-    if engine == "drum-nmf" and not t.is_drum:
-        raise ApiError(422, "bad_engine", "the drum engine only applies to the drum stem")
-    if t.is_drum and engine != "drum-nmf":
-        raise ApiError(422, "bad_engine", "drum stems use the drum engine")
+    allowed = allowed_engines(t.stem, t.is_drum)
+    if engine not in allowed:
+        raise ApiError(422, "bad_engine",
+                       f"{engine!r} is not available for this track; choose one of: {', '.join(allowed)}")
     try:
         job = queue.enqueue(db, project_id, "retranscribe",
                             {"track_id": t.id, "engine": body.engine, "params": body.params}, priority=50)
@@ -488,7 +489,8 @@ def _cleanup_tmpdir(path: Path) -> None:
 
 
 @router.get("/projects/{project_id}/export/midi")
-def export_midi(project_id: str, db: DB, background: BackgroundTasks, stems: str | None = None) -> FileResponse:
+def export_midi(project_id: str, db: DB, background: BackgroundTasks, stems: str | None = None,
+                tempo_map: bool = False) -> FileResponse:
     """MIDI rendered from the *current edited* notes, validated with an independent parser."""
     p = _get_project(db, project_id)
     tracks = [t for t in services.select_tracks(p, stems) if t.transcription_status == "done"]
@@ -499,7 +501,7 @@ def export_midi(project_id: str, db: DB, background: BackgroundTasks, stems: str
     suffix = tracks[0].stem if len(tracks) == 1 else "multitrack"
     out = td / f"{services._slug(p.name)}-{suffix}.mid"
     try:
-        services.build_export_midi(p, tracks, out)
+        services.build_export_midi(p, tracks, out, tempo_map=tempo_map)
     except Exception as exc:
         raise ApiError(500, "midi_invalid", f"MIDI validation failed: {exc}") from exc
     return FileResponse(out, media_type="audio/midi", filename=out.name)
@@ -509,19 +511,81 @@ def export_midi(project_id: str, db: DB, background: BackgroundTasks, stems: str
 def export_bundle(
     project_id: str, db: DB, background: BackgroundTasks, stems: str | None = None,
     include_stems: bool = True, include_midi: bool = True, full: bool = False,
+    mode: Literal["synced", "trimmed"] = "synced", mix: str | None = None, tempo_map: bool = False,
 ) -> FileResponse:
+    """Zip export.
+
+    ``stems``: tracks to export; omitted means the audible, identified sources (silent tracks,
+    unresolved sources, drum-kit masks and the full-mix transcription are opt-in). ``mode``:
+    ``synced`` keeps every file on the full project timeline for a DAW; ``trimmed`` removes
+    leading/trailing silence and records each file's timeline offset in export_manifest.json.
+    ``mix``: comma-separated tracks to sum into a rendered mix (the client passes only unmuted
+    lanes); stems listed in ``stems`` are exported either way.
+    """
     p = _get_project(db, project_id)
     if p.status != "ready":
         raise ApiError(409, "not_ready", "the project has not finished processing")
-    tracks = services.select_tracks(p, stems)
+    tracks = services.select_tracks(p, stems) if (stems or full) else exports.default_tracks(p)
     if not tracks:
         raise ApiError(404, "nothing_to_export", "no tracks selected")
+    mix_tracks = services.select_tracks(p, mix) if mix else None
+    if mix and not mix_tracks:
+        raise ApiError(404, "nothing_to_export", "no tracks selected for the mix")
     td = Path(tempfile.mkdtemp(prefix="sf-bundle-"))
     background.add_task(_cleanup_tmpdir, td)
     kind = "project" if full else "export"
     out = td / f"{services._slug(p.name)}-{kind}.zip"
-    services.write_bundle(db, p, out, tracks, include_stems or full, include_midi, full)
+    services.write_bundle(db, p, out, tracks, include_stems or full, include_midi, full,
+                          mode="synced" if full else mode, mix_tracks=None if full else mix_tracks,
+                          tempo_map=tempo_map and not full)
     return FileResponse(out, media_type="application/zip", filename=out.name)
+
+
+@router.get("/projects/{project_id}/export/soundtrap")
+def export_soundtrap(project_id: str, db: DB, background: BackgroundTasks, stems: str | None = None) -> FileResponse:
+    """Everything needed to rebuild the song in Soundtrap: per-track MIDI at one integer tempo,
+    full-length 24-bit WAV stems (Soundtrap does not import FLAC) and step-by-step instructions."""
+    import zipfile
+
+    p = _get_project(db, project_id)
+    if p.status != "ready":
+        raise ApiError(409, "not_ready", "the project has not finished processing")
+    tracks = services.select_tracks(p, stems) if stems else exports.default_tracks(p)
+    if not tracks:
+        raise ApiError(404, "nothing_to_export", "no tracks selected")
+    td = Path(tempfile.mkdtemp(prefix="sf-soundtrap-"))
+    background.add_task(_cleanup_tmpdir, td)
+    files = td / "files"
+    files.mkdir()
+    man = exports.soundtrap_package(get_storage(), p, tracks, files, services.build_export_midi)
+    out = td / f"{services._slug(p.name)}-soundtrap.zip"
+    with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED, allowZip64=True) as z:
+        for f in sorted(files.iterdir()):
+            z.write(f, f.name, compress_type=zipfile.ZIP_STORED if f.suffix == ".wav" else zipfile.ZIP_DEFLATED)
+        z.writestr("SOUNDTRAP.md", exports.soundtrap_readme(man))
+        z.writestr("export_manifest.json", json.dumps(man, indent=2, default=float))
+        z.writestr("ATTRIBUTION.txt", services.ATTRIBUTION)
+    return FileResponse(out, media_type="application/zip", filename=out.name)
+
+
+@router.get("/projects/{project_id}/tracks/{track_id}/audio")
+def export_track_audio(project_id: str, track_id: str, db: DB, background: BackgroundTasks,
+                       mode: Literal["synced", "trimmed"] = "trimmed") -> FileResponse:
+    """One source as FLAC. ``trimmed`` (default for a single download) drops leading/trailing
+    silence; the original-timeline position is in the X-Stemforge-Timeline-Start header."""
+    p = _get_project(db, project_id)
+    t = next((x for x in p.tracks if x.id == track_id), None)
+    if t is None:
+        raise ApiError(404, "not_found", "track not found")
+    td = Path(tempfile.mkdtemp(prefix="sf-audio-"))
+    background.add_task(_cleanup_tmpdir, td)
+    path, entry = exports.export_track_audio(get_storage(), p, t, mode, td)
+    if path is None:
+        raise ApiError(404, "nothing_to_export", entry.get("excluded", "no audio"))
+    headers = {"X-Stemforge-Timeline-Start": str(entry["timeline_start_seconds"]),
+               "X-Stemforge-PCM-SHA256": entry["pcm_sha256"],
+               "Access-Control-Expose-Headers": "X-Stemforge-Timeline-Start, X-Stemforge-PCM-SHA256"}
+    return FileResponse(path, media_type="audio/flac", filename=path.name, headers=headers)
 
 
 @router.post("/projects/import", response_model=ProjectDetail, status_code=201)

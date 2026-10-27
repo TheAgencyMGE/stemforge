@@ -58,6 +58,20 @@ def apply(stem: str, engine: str, notes: list[dict], audio: np.ndarray | None, s
                 ),
                 "note_ids": [n["id"] for n in octave_notes],
             })
+    if engine == "basic-pitch" and audio is not None and copied and stem != "mix":
+        copied, merged = merge_split_sustains(copied, audio, sr)
+        if merged:
+            suggestions.append({
+                "code": "merged_sustain",
+                "severity": "info",
+                "message": (
+                    f"{_count(len(merged), 'note')} that the model had split into fragments "
+                    f"{'was' if len(merged) == 1 else 'were'} joined to the note before: same pitch, a gap under "
+                    f"{int(SPLIT_GAP_S * 1000)} ms, and no new attack in the audio at that pitch. Notes with an "
+                    "attack are always kept separate. The raw model notes are stored with the track."
+                ),
+                "note_ids": merged[:80],
+            })
     suggestions.extend(review_notes(stem, copied))
     tab = tablature_estimate(copied) if stem == "guitar" else None
     if stem in {"piano", "guitar"}:
@@ -65,6 +79,88 @@ def apply(stem: str, engine: str, notes: list[dict], audio: np.ndarray | None, s
         if chord is not None:
             suggestions.append(chord)
     return Refined(copied, suggestions, tab)
+
+
+# Measured on the bundled fixture (docs/EVALUATION.md): a rise threshold of 1.2 merged 25 split
+# sustains without losing a reference note; 2.0 started merging real repeated bass notes.
+SPLIT_GAP_S = 0.03
+SPLIT_RISE = 1.2
+
+
+def merge_split_sustains(notes: list[dict], audio: np.ndarray, sr: int, gap_s: float = SPLIT_GAP_S,
+                         rise: float = SPLIT_RISE) -> tuple[list[dict], list[str]]:
+    """Join a note to the same-pitch note just before it when the audio shows no new attack.
+
+    Evidence: constant-Q magnitude at that pitch just after the second onset, relative to just
+    before it. A re-struck note raises it; a sustain the model fragmented does not. Repeated notes
+    with a real attack are never merged. Returns (notes, ids of the merged kept notes).
+    """
+    import librosa
+
+    y = librosa.resample(to_mono(audio), orig_sr=sr, target_sr=22050, res_type="soxr_hq")
+    if y.size < 4096:
+        return notes, []
+    cqt = np.abs(librosa.cqt(y, sr=22050, hop_length=256, fmin=librosa.midi_to_hz(21), n_bins=88,
+                             bins_per_octave=12))
+    fps = 22050 / 256
+    by_pitch: dict[int, list[dict]] = {}
+    for n in sorted(notes, key=lambda n: float(n["start"])):
+        by_pitch.setdefault(int(n["pitch"]), []).append(n)
+    out: list[dict] = []
+    merged_ids: list[str] = []
+    for pitch, seq in by_pitch.items():
+        row = int(np.clip(pitch - 21, 0, 87))
+        cur = seq[0]
+        for nxt in seq[1:]:
+            gap = float(nxt["start"]) - float(cur["end"])
+            i = int(float(nxt["start"]) * fps)
+            before = float(cqt[row, max(0, i - 6): max(1, i - 1)].mean()) if i > 1 else 0.0
+            after = float(cqt[row, i: i + 4].max()) if i < cqt.shape[1] else 0.0
+            if gap <= gap_s and after < rise * (before + 1e-9):
+                cur["end"] = max(float(cur["end"]), float(nxt["end"]))
+                if cur.get("confidence") is not None and nxt.get("confidence") is not None:
+                    cur["confidence"] = round(max(float(cur["confidence"]), float(nxt["confidence"])), 3)
+                cur["bends"] = None  # bend points were relative to the shorter note
+                flags = list(cur.get("flags") or [])
+                if "merged_sustain" not in flags:
+                    flags.append("merged_sustain")
+                cur["flags"] = flags
+                if cur["id"] not in merged_ids:
+                    merged_ids.append(cur["id"])
+            else:
+                out.append(cur)
+                cur = nxt
+        out.append(cur)
+    out.sort(key=lambda n: (float(n["start"]), int(n["pitch"])))
+    return out, merged_ids
+
+
+# A note heard in two sources is attributed to the source where the model hears it at least this
+# much louder; the quieter copy is bleed. 1.5 kept every reference note on the fixture.
+CROSS_SOURCE_RATIO = 1.5
+
+
+def cross_source_duplicates(tracks: dict[str, list[dict]], onset_tol: float = 0.05,
+                            ratio: float = CROSS_SOURCE_RATIO) -> dict[str, list[str]]:
+    """Ids of notes that duplicate a clearly louder note of another pitched source (bleed copies).
+
+    Returns {stem: [note ids]}. Notes without a model confidence (user-drawn) are never touched.
+    """
+    out: dict[str, list[str]] = {}
+    names = list(tracks)
+    for a in names:
+        for n in tracks[a]:
+            if n.get("confidence") is None:
+                continue
+            for b in names:
+                if b == a:
+                    continue
+                if any(int(m["pitch"]) == int(n["pitch"]) and abs(float(m["start"]) - float(n["start"])) <= onset_tol
+                       and m.get("confidence") is not None
+                       and float(m["confidence"]) >= ratio * float(n["confidence"]) for m in tracks[b]):
+                    out.setdefault(a, []).append(n["id"])
+                    break
+    return out
 
 
 def correct_bass_octaves(notes: list[dict], audio: np.ndarray, sr: int) -> tuple[list[dict], list[dict]]:

@@ -51,6 +51,17 @@ class Settings(BaseSettings):
     demucs_segment: float | None = None  # seconds; lower to reduce VRAM (<= 7.8 for HT models)
     demucs_shifts: int = 0  # >0 adds random time shifts (slower, non-deterministic)
     separation_chunk_seconds: float = 30.0
+    # Optional research engines, each in its own virtualenv (see pipeline/external.py).
+    # Let installed research engines into the automatic engine policy (off: Basic Pitch/pYIN/NMF only).
+    research_engines: bool = False
+    transkun_python: str = ""
+    muscriptor_python: str = ""
+    yourmt3_python: str = ""
+    yourmt3_dir: str = ""  # checkout of the mimbres/YourMT3 space with its checkpoint
+    muscriptor_model: Literal["small", "medium", "large"] = "small"  # small is the CPU-practical size
+    # MIDI rendering for fidelity checks (pipeline/render.py): FluidSynth binary and an SF2/SF3 soundfont.
+    fluidsynth_path: str = ""
+    soundfont_path: str = ""
 
     # Worker / queue
     worker_concurrency: int = 1

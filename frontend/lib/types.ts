@@ -22,13 +22,48 @@ export interface NotesDoc {
 
 export interface Artifact {
   id: string;
-  kind: "master" | "preview" | "stem" | "peaks" | "spectrogram" | "midi" | "midi_combined";
+  kind: "master" | "preview" | "stem" | "peaks" | "spectrogram" | "midi" | "midi_combined" | "residual" | "discovery" | "midi_render";
   stem: string | null;
   filename: string;
   content_type: string;
   size: number;
   url: string;
   meta: Record<string, unknown>;
+}
+
+export interface SourceCandidate {
+  id: string;
+  name: string;
+  score: number;
+}
+
+/** What discovery established about one source (backend: pipeline/discovery.py). */
+export interface SourceInfo {
+  status: "accepted" | "unresolved";
+  identity: string | null;
+  family: string;
+  display: string;
+  /** single = one instrument named; group = several, not separable; unresolved = no confident name. */
+  kind: "single" | "group" | "unresolved";
+  /** Tag probability that supports the identity. null when the tagger is not installed. */
+  confidence: number | null;
+  family_score: number | null;
+  candidates: SourceCandidate[];
+  contains: SourceCandidate[];
+  activity: {
+    active_seconds: number;
+    active_fraction: number;
+    first_active: number | null;
+    last_active: number | null;
+    median_active_rel_db: number | null;
+    segments: [number, number][];
+  };
+  /** How the audio was obtained, e.g. "htdemucs:other" or an HPSS / ratio-mask description. */
+  separation: string;
+  /** broad = a separator stem; targeted = split from a parent; residual/group/unresolved = what remained. */
+  isolation: "broad" | "targeted" | "residual" | "group" | "unresolved";
+  limitations: string[];
+  absorbed?: { from: string; rel_db: number }[];
 }
 
 export interface TrackStats {
@@ -38,6 +73,14 @@ export interface TrackStats {
   relative_db?: number;
   silent?: boolean;
   mix_residual_db?: number;
+  source?: SourceInfo;
+  /** The track's MIDI rendered through a GM soundfont, compared with its own stem (backend render.py). */
+  render_fidelity?: { chroma_similarity: number | null; onset_correlation: number | null; logmel_l1_db: number | null };
+}
+
+export interface DiscoveryLogEntry {
+  step: string;
+  [k: string]: unknown;
 }
 
 export interface Track {
@@ -57,6 +100,8 @@ export interface Track {
   note_count: number;
   edited: boolean;
   transcription_status: "pending" | "done" | "skipped" | "failed";
+  /** Engines the server accepts for this track (installed ones only), in preference order. */
+  allowed_engines?: EngineId[];
   transcription_summary: {
     count?: number;
     mean_confidence?: number | null;
@@ -126,6 +171,12 @@ export interface Analysis {
   key: KeyInfo | null;
   sections: { start: number; end: number; label: string }[];
   silent: boolean;
+  discovery?: {
+    version: number;
+    tagger: string;
+    log: DiscoveryLogEntry[];
+    reconstruction: { residual_db: number; unexplained_by_tracks_db: number; internal_residual_db: number | null; tracks: number };
+  };
   meter?: {
     time_signature: string | null;
     beats_per_bar: number | null;
@@ -169,7 +220,7 @@ export interface ProjectDetail extends ProjectSummary {
   job: Job | null;
 }
 
-export type EngineId = "basic-pitch" | "pyin" | "drum-nmf";
+export type EngineId = "basic-pitch" | "pyin" | "drum-nmf" | "onset-events" | "transkun" | "yourmt3" | "muscriptor";
 
 export interface EngineInfo {
   id: EngineId;

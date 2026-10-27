@@ -95,6 +95,7 @@ class TrackOut(BaseModel):
     edited: bool
     transcription_status: str
     transcription_summary: dict[str, Any] | None
+    allowed_engines: list[str] = []
 
 
 class StageOut(BaseModel):
@@ -162,7 +163,7 @@ class TrackPatch(BaseModel):
 
 
 class RetranscribeIn(BaseModel):
-    engine: Literal["basic-pitch", "pyin", "drum-nmf"] | None = None
+    engine: str | None = Field(default=None, max_length=32)  # checked against the engine registry
     params: dict[str, float | None] = {}
 
 
@@ -194,6 +195,7 @@ class EngineOut(BaseModel):
     polyphonic: bool
     description: str
     defaults: dict[str, Any]
+    external: bool = False
 
 
 class ModelStatus(BaseModel):

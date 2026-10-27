@@ -1,22 +1,26 @@
 # Stemforge
 
-Stemforge takes a song apart. Upload a track and it runs a fixed pipeline:
+Stemforge takes a song apart. Upload a track and it:
 
-1. **Separate** the mix into vocals, drums, bass and "other", and optionally guitar and piano.
-2. **Transcribe** each stem to MIDI with an engine chosen for that kind of instrument.
+1. **Discovers** which sources are actually in the recording. A broad separation (HTDemucs) is checked source by source: is it audible as a part of its own, and what do instrument tags computed on that source say it is? Absent instruments get no track. The leftover "other" stem is treated as a residual to explain: targeted extractions run when the evidence justifies them, and what remains is named after the instrument(s) it holds, or marked as an unresolved source for review.
+2. **Transcribes** each source to MIDI with an engine chosen for it, then refines the notes only where the audio supports a correction (raw model notes are kept).
 3. **Edit** the result in a synced, DAW-style workspace: multitrack audio, a piano roll over a pitch spectrogram, a confidence overlay, quantize, snap-to-key and velocity editing.
-4. **Export** stems, per-track MIDI, a multitrack MIDI file, or a restorable project bundle.
+4. **Exports** lossless FLAC per source (full-timeline synchronized or trimmed with recorded offsets), per-track and multitrack MIDI, a rendered mix of the unmuted tracks, or a restorable project bundle. Every zip carries an `export_manifest.json`.
 
 All inference is real:
-- **Separation:** HTDemucs.
+- **Separation:** HTDemucs (4-stem; `htdemucs_6s` ratios for guitar/piano when tags call for them; HPSS for auxiliary percussion).
+- **Instrument identification:** PANNs Cnn14 AudioSet tagging (MIT code, CC BY 4.0 weights).
 - **Pitched transcription:** Spotify Basic Pitch and pYIN.
-- **Drums:** semi-adaptive NMF.
+- **Drums:** semi-adaptive NMF. **Auxiliary percussion:** onset events.
 
-Nothing is simulated. Silent or near-silent stems are reported as such and are not transcribed.
+Nothing is simulated. A source is never invented to fill a slot, and the app reports how well the sources rebuild the original mix.
 
 ```
-Upload → Analyze → Separate → Transcribe → Edit → Export
+Upload → Analyze → Separate → Discover sources → Transcribe → Refine → Edit → Export
 ```
+
+* Suno's published stem-separation behaviour, the open models, and their licences: [docs/RESEARCH.md](docs/RESEARCH.md)
+* Rebuilding a song in Soundtrap, research transcription engines, and measured fidelity: [docs/RECONSTRUCTION.md](docs/RECONSTRUCTION.md)
 
 * Architecture and model selection: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
 * Measured accuracy on the bundled fixture: [docs/EVALUATION.md](docs/EVALUATION.md)
@@ -26,13 +30,17 @@ Upload → Analyze → Separate → Transcribe → Edit → Export
 
 | Area | What you get |
 |---|---|
-| **Pipeline** | Validation by magic bytes and a full decode. Analysis: tempo with a regression-refined beat grid, key with a runner-up, and unsupervised sections. HTDemucs 4-stem separation, plus optional `htdemucs_6s` for guitar and piano. Per-stem transcription, then MIDI written with mido and re-parsed by symusic. |
+| **Pipeline** | Validation by magic bytes and a full decode. Analysis: tempo with a regression-refined beat grid, key with a runner-up, and unsupervised sections. HTDemucs separation with a mixture-silence gate, then source discovery (activity + PANNs tags, residual-guided extraction, bleed reassignment, reconstruction check). No fixed stem count. Per-source transcription, then MIDI written with mido and re-parsed by symusic. |
+| **Discovery** | Each source records its identity, family, tag evidence, audible time, separation method and limitations; the inspector shows the decision log, including instruments checked and *not* found. |
 | **Engines** | **Basic Pitch:** polyphonic (piano, guitar, other, and an optional pass on the whole mix) and band-limited bass, with pitch bends. **pYIN:** monophonic, the vocal default, with bends from the f0 contour. **Drum NMF:** kick, snare and hi-hat (GM 36/38/42), with spectral relabels for open hat, pedal hat, crash, tom, side-stick and clap when the hit does not match the template. The policy is explained in the UI, and you can switch engine per track. |
 | **Re-tuning** | Onset, sustain and voicing thresholds, minimum note length and frequency band. Model output is cached, so re-thresholding takes about a second. |
 | **Workspace** | Sample-locked Web Audio playback of every stem. Per-lane mute, solo, volume, audio monitor and MIDI-preview synth. A/B against the original mix. Loop regions, a follow playhead, and bar/beat ruler with section markers. |
 | **Piano roll** | Move, resize (either edge), insert, delete and marquee-select notes, with copy/paste and duplicate. Snap to 1/1–1/32 including triplets. Quantize with strength, transpose, snap-to-key, a velocity lane, a bend display, and a constant-Q spectrogram underlay aligned to pitch rows. The confidence overlay dashes uncertain notes; user-drawn notes are marked as such. |
 | **Editing safety** | Per-track undo/redo, debounced autosave with optimistic concurrency (409 on conflicts), and reset to the model output. |
-| **Export** | One-click full export, a selective zip, multitrack or per-track MIDI built from your edits, and a full project bundle that you can re-import. Trimmed sections keep the original timeline: MIDI is offset accordingly. |
+| **Export** | Default export = every audible source (unresolved ones are included and marked; silent and mask tracks are opt-in). Synchronized full-length FLAC for a DAW, or trimmed files with each start time in `export_manifest.json`. FLAC is verified bit-exact on write and export. A rendered mix sums only the unmuted lanes; muting never alters a stored stem. Per-track FLAC (trimmed or full) and MIDI from the inspector. Full project bundles re-import. |
+| **Soundtrap** | One-click package: one MIDI file per track at a whole-number tempo Soundtrap can be set to, full-length 24-bit WAV stems (Soundtrap does not import FLAC), and step-by-step instructions with an instrument suggestion per track. |
+| **Research engines** | Optional, isolated: Transkun (piano, with velocity), YourMT3+ and MuScriptor (multi-instrument). Shown only when installed; benchmarked on BabySlakh. |
+| **Render fidelity** | With FluidSynth configured, each track's MIDI is rendered through a GM soundfont and compared with its stem: pitch match, rhythm match and overall sound difference, plus the render to listen to. |
 | **Jobs** | Durable DB queue with leases, heartbeats, backoff retries and cancellation. Resume skips finished stages through artifact hashes. Stage-level progress, and an ETA only once it is measurable. |
 | **Ops** | Private storage (local or S3) behind HMAC-signed or presigned URLs. Size, duration and channel limits, a storage quota, retention cleanup and rate limiting. Structured JSON logs with request ids, `/api/healthz` and `/api/readyz`, Alembic migrations, and an optional API token. |
 
@@ -95,7 +103,7 @@ Compose runs these services:
 - **Verified:** each file is SHA-256 checked against the Hub's LFS object id before it is moved into place, and checked again before every load.
 - **No pickles:** only `.safetensors` are accepted, and only classes under `demucs.` are instantiated.
 
-Defaults are `htdemucs` (84 MB) and `htdemucs_6s` (55 MB). `htdemucs_ft` (4 × 84 MB, about 4× slower) is optional; select it with `STEMFORGE_DEMUCS_MODEL=htdemucs_ft`. Basic Pitch's ONNX model ships inside the `basic-pitch` package.
+Defaults are `htdemucs` (84 MB), `htdemucs_6s` (55 MB) and the instrument tagger `panns_cnn14_16k` (323 MB). The tagger comes from Zenodo as a PyTorch checkpoint: its published MD5 and a pinned SHA-256 are checked, it is opened once with PyTorch's restricted `weights_only` loader, converted to safetensors, and the converted file is pinned too. Already have the file? `stemforge-models download panns_cnn14_16k --source-file Cnn14_16k_mAP=0.438.pth` runs the same checks. Without the tagger, discovery falls back to energy-only decisions and labels sources as unidentified. `htdemucs_ft` (4 × 84 MB, about 4× slower) is optional; select it with `STEMFORGE_DEMUCS_MODEL=htdemucs_ft`. Basic Pitch's ONNX model ships inside the `basic-pitch` package.
 
 ```bash
 stemforge-models list     # status + license notes
@@ -133,6 +141,10 @@ Every setting is an environment variable `STEMFORGE_<NAME>` (or a line in `backe
 | `DEVICE` | `auto` | `auto`, `cuda` or `cpu` |
 | `DEMUCS_MODEL` / `DEMUCS_SEGMENT` / `DEMUCS_SHIFTS` | `htdemucs` / auto / 0 | `shifts>0` adds random time shifts: slower, and not deterministic. |
 | `WORKER_CONCURRENCY` | 1 | Processes per `stemforge-worker`. You can also run more workers. |
+| `TRANSKUN_PYTHON` / `YOURMT3_PYTHON` + `YOURMT3_DIR` / `MUSCRIPTOR_PYTHON` | empty | Optional research transcription engines, each in its own environment (`scripts/setup-research.ps1`). Non-commercial research use; see THIRD_PARTY_NOTICES. |
+| `RESEARCH_ENGINES` | false | Let installed research engines into the automatic engine policy, where a benchmark supports it (currently: Transkun for piano). |
+| `MUSCRIPTOR_MODEL` | small | `small`, `medium` or `large` (large needs a GPU). |
+| `FLUIDSYNTH_PATH` / `SOUNDFONT_PATH` | empty | Render each track's MIDI through a General MIDI soundfont and measure it against its stem. |
 | `JOB_MAX_ATTEMPTS` / `JOB_LEASE_SECONDS` | 3 / 120 | Retry and lease policy |
 
 ## Production deployment
@@ -146,7 +158,7 @@ Every setting is an environment variable `STEMFORGE_<NAME>` (or a line in `backe
 ## Tests
 
 ```bash
-cd backend && pytest -q                    # 44 tests: units, queue, API, full real-model pipeline
+cd backend && pytest -q                    # units, queue, API, discovery/export regressions, full real-model pipeline
 cd frontend && npm test                    # 25 unit tests (vitest)
 cd frontend && npm run test:e2e            # Playwright; needs stemforge-api + stemforge-worker running
 python backend/scripts/evaluate.py --out docs/EVALUATION.md   # accuracy vs ground truth
@@ -160,8 +172,9 @@ Also: `ruff check`, `mypy stemforge`, `npm run lint`, `npm run typecheck`, `npm 
 
 ## Known limitations
 
-* **Separation.** Quality is bounded by HTDemucs: reverb and dense mixes bleed between stems. The 6-stem piano is unreliable, as upstream notes; guitar is usable. The synthetic demo's lead synth lands in "Other", so its vocal stem is (correctly) silent.
-* **Polyphonic transcription.** Dense or distorted material stays ambiguous. On the fixture the "Other" stem reaches F1 0.66: it finds every note, but adds extra ones (octave and harmonic errors). Use the confidence overlay and the cleanup tools.
+* **Separation.** Quality is bounded by HTDemucs: reverb and dense mixes bleed between stems. Only drums, bass, vocals, guitar, piano and percussive textures can be pulled apart with the bundled, permissively usable models. Strings, brass, woodwinds, synths and ensembles are *identified* but stay together in the residual, which is labelled with what it holds (for example "Strings + Brass"). Query-conditioned separation that could split them (Banquet) has non-commercial weights and is not bundled; see docs/RESEARCH.md.
+* **Identification.** PANNs tags are clip-level AudioSet labels. They distinguish families well and close members (alto vs tenor sax, lead vs rhythm guitar) not at all. Lead/rhythm and other musical roles are never presented as separate sources.
+* **Polyphonic transcription.** Dense or distorted material stays ambiguous. On the demo fixture, all pitched sources together reach onset F1 0.765 after refinement (0.693 raw) with full recall; the remaining false notes are mostly re-attacks inside held notes and octave errors. Use the confidence overlay and the cleanup tools. See docs/EVALUATION.md.
 * **Drums.** The learned part is three NMF templates. Open hat, pedal hat, crash, tom, side-stick and clap are relabels when the spectrum disagrees; ride, tambourine and shaker are not detected. NMF is near perfect on the synthetic kit's kick, snare and closed hat; expect lower accuracy on real kits with heavy room sound. Strings, brass, woodwinds and most keyboards are not separated. See [docs/MODELS.md](docs/MODELS.md).
 * **Analysis.** Key is global Krumhansl–Schmuckler, and relative major/minor can swap (the demo reads C major, runner-up A minor). Tempo is one constant tempo; the beat grid has no tempo map. Section labels are unsupervised letters.
 * **MIDI pitch bends.** These are only emitted for monophonic passages, because bend is per channel.

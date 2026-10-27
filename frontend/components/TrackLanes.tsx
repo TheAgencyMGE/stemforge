@@ -2,10 +2,10 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useWorkspace } from "./Workspace";
-import { STEM_COLOR, STEM_HEX } from "@/lib/format";
+import { STEM_COLOR, STEM_HEX, stemKey } from "@/lib/format";
 import { secondsPerBeat } from "@/lib/notes";
 import { ORIGINAL_LANE, useEditor } from "@/lib/store";
-import type { Note, Peaks } from "@/lib/types";
+import type { Note, Peaks, Track } from "@/lib/types";
 
 const RULER = 24;
 
@@ -137,7 +137,8 @@ export function TrackLanes() {
       g.fillRect(0, y, size.w, laneH);
       g.fillStyle = "#232931";
       g.fillRect(0, y + laneH - 1, size.w, 1);
-      const color = STEM_HEX[lane.stem] ?? "#9aa3ad";
+      const laneTrack = lane.trackId ? project.tracks.find((t) => t.id === lane.trackId) : null;
+      const color = STEM_HEX[laneTrack ? stemKey(laneTrack) : lane.stem] ?? "#9aa3ad";
       const m = mix[lane.id];
       const dim = m && (m.muted || (Object.values(mix).some((x) => x.soloed) && !m.soloed));
       const p = peaks[lane.id];
@@ -152,7 +153,7 @@ export function TrackLanes() {
         g.fillRect(xe, RULER, size.w - xe, size.h - RULER);
       }
     }
-  }, [size, scrollX, pps, lanes, peaks, notes, mix, selectedTrackId, laneH, duration, project.analysis, project.offset_seconds, division, tsig, tempo]);
+  }, [size, scrollX, pps, lanes, peaks, notes, mix, selectedTrackId, laneH, duration, project.analysis, project.offset_seconds, project.tracks, division, tsig, tempo]);
 
   // ---- overlay: playhead + loop, every frame ----
   useEffect(() => {
@@ -209,11 +210,12 @@ export function TrackLanes() {
               key={lane.id}
               role="listitem"
               className={`lane-head ${lane.trackId && lane.trackId === selectedTrackId ? "selected" : ""}`}
-              style={{ ["--lane-color" as string]: STEM_COLOR[lane.stem] ?? "var(--stem-original)" }}
+              style={{ ["--lane-color" as string]: STEM_COLOR[track ? stemKey(track) : lane.stem] ?? "var(--stem-original)" }}
               onClick={() => lane.trackId && selectTrack(lane.trackId)}
             >
               <div className="lname">
                 <span>{lane.name}</span>
+                {track?.stats.source && <SourceBadge source={track.stats.source} />}
                 {track?.warnings.length ? <span title={track.warnings.join("\n")} style={{ color: "var(--warn)" }} aria-label="Has warnings">⚠</span> : null}
                 {load === undefined && project.artifacts.some((x) => x.kind === "preview" && x.stem === lane.stem) && <span className="faint" style={{ fontSize: 11 }}>loading…</span>}
                 {load === "error" && <span style={{ color: "var(--err)", fontSize: 11 }}>audio error</span>}
@@ -342,3 +344,20 @@ function drawMiniNotes(g: CanvasRenderingContext2D, notes: Note[], y: number, h:
   }
   g.globalAlpha = 1;
 }
+
+function SourceBadge({ source }: { source: NonNullable<Track["stats"]["source"]> }) {
+  if (source.status === "unresolved") {
+    return <span className="chip warn" style={{ fontSize: 10 }} title="Audible, but no instrument could be identified with confidence. Review it in the inspector.">unresolved</span>;
+  }
+  if (source.confidence == null) {
+    return <span className="chip" style={{ fontSize: 10 }} title="Presence decided from energy only; the instrument tagger is not installed.">unverified</span>;
+  }
+  const pct = Math.round(source.confidence * 100);
+  const tip = [
+    `Identity evidence: ${pct}% tag probability (${source.kind === "group" ? "several instruments" : "single instrument"}).`,
+    `Audible for ${source.activity.active_seconds.toFixed(1)} s.`,
+    `Separation: ${source.separation}.`,
+  ].join("\n");
+  return <span className={`chip ${source.confidence >= 0.4 ? "ok" : ""}`} style={{ fontSize: 10 }} title={tip}>{pct}%</span>;
+}
+

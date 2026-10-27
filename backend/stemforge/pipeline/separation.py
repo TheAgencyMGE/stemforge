@@ -118,7 +118,9 @@ class DemucsSeparator:
                 "model": self.model_name, "chunk": i + 1, "of": len(starts),
                 "elapsed": round(time.monotonic() - t0, 2), "device": device,
             })
-        out = overlap_add(pieces, n, overlap) * std + mean
+        # Demucs' own CLI adds the mixture mean back to every source, which puts N copies of the
+        # mixture DC into the sum and a DC floor into "silent" stems. Split it once across sources.
+        out = overlap_add(pieces, n, overlap) * std + mean / len(self.sources)
         return {src: out[k] for k, src in enumerate(self.sources)}
 
     def _run(self, apply_model, piece, device: str, segment: float | None) -> np.ndarray:
@@ -180,6 +182,45 @@ class AudioSeparatorAdapter:
                 data, _ = sf.read(str(Path(td) / Path(f).name), dtype="float32", always_2d=True)
                 result[key] = data.T
             return result
+
+
+def gate_mixture_silence(mix: np.ndarray, stems: dict[str, np.ndarray], sr: int, floor_db: float = -90.0,
+                         min_seconds: float = 0.05, fade_seconds: float = 0.005) -> dict[str, np.ndarray]:
+    """Zero every stem where the *input mixture* is digitally silent.
+
+    The sources must sum to the mixture, so where the mixture is below ``floor_db`` for at least
+    ``min_seconds`` the only consistent estimate is silence; anything a separator emits there is a
+    model artifact. Short fades avoid clicks. Musical content is never touched: the gate only acts
+    where the mixture itself has nothing. Lengths and alignment are unchanged.
+    """
+    n = mix.shape[-1]
+    hop = max(1, int(0.001 * sr))
+    frames = int(np.ceil(n / hop))
+    padded = np.zeros((mix.shape[0], frames * hop), dtype=np.float32)
+    padded[:, :n] = np.abs(mix)
+    peak = padded.reshape(mix.shape[0], frames, hop).max(axis=(0, 2))
+    quiet = peak < 10 ** (floor_db / 20)
+    keep = np.ones(frames, dtype=np.float32)
+    min_frames = max(1, int(round(min_seconds * sr / hop)))
+    i = 0
+    while i < frames:
+        if not quiet[i]:
+            i += 1
+            continue
+        j = i
+        while j < frames and quiet[j]:
+            j += 1
+        if j - i >= min_frames:
+            keep[i:j] = 0.0
+        i = j
+    if keep.all():
+        return stems
+    hard = np.repeat(keep, hop)[:n]
+    fade = max(1, int(fade_seconds * sr))
+    # Ramps sit inside the silent run, so audible samples always keep unity gain.
+    smooth = np.convolve(hard, np.ones(fade, dtype=np.float32) / fade, mode="same") if fade > 1 else hard
+    gain = np.where(hard > 0, 1.0, np.clip(smooth, 0.0, 1.0)).astype(np.float32)
+    return {name: (data * gain).astype(np.float32) for name, data in stems.items()}
 
 
 def residual_db(mix: np.ndarray, stems: dict[str, np.ndarray]) -> float:

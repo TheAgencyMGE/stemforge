@@ -1,10 +1,15 @@
-"""Measure separation + transcription quality on the bundled demo against its ground truth.
+"""Measure discovery, separation and transcription on fixtures with exact ground truth.
 
-    python scripts/evaluate.py [--engines all] [--out ../docs/EVALUATION.md]
+    python scripts/evaluate.py [--fixtures demo keys_solo drums_bass long_demo] [--out ../docs/EVALUATION.md]
 
-Note-level metrics use mir_eval (onset tolerance 50 ms, offsets ignored). Drums are scored per
-GM class on onsets. Numbers are for a synthetic fixture: they validate the pipeline and the
-engine policy, and are not a claim about accuracy on commercial recordings.
+The path scored is the production one: HTDemucs, mixture-silence gate, source discovery (PANNs
+tags if installed), the policy engine per source, note refinement, and cross-source attribution.
+Raw model notes and refined notes are both scored, so every refinement is justified by numbers.
+
+Metrics (mir_eval): note onset F1 (50 ms, 50 cents, offsets ignored); onset+offset F1 (offset
+within 20% of the note or 50 ms); drums: onset F1 per GM class. Fixtures are synthetic (see
+samples/fixtures.py); the numbers validate behaviour, they do not predict accuracy on commercial
+recordings.
 """
 
 from __future__ import annotations
@@ -19,29 +24,44 @@ import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT.parent / "samples"))
 
-from stemforge.pipeline import analysis, audio, transcription  # noqa: E402
-from stemforge.pipeline.separation import DemucsSeparator, residual_db  # noqa: E402
+from stemforge.pipeline import audio, refine, transcription  # noqa: E402
+from stemforge.pipeline.discovery import discover  # noqa: E402
+from stemforge.pipeline.separation import DemucsSeparator, gate_mixture_silence, resolve_device  # noqa: E402
 
 
-def note_f1(ref: list[dict], est: list[dict]) -> dict:
+def transcription_hz(m: int) -> float:
+    return 440.0 * 2 ** ((m - 69) / 12)
+
+
+def _arrays(notes: list[dict]) -> tuple[np.ndarray, np.ndarray]:
+    iv = np.array([[n["start"], max(n["end"], n["start"] + 0.01)] for n in notes]).reshape(-1, 2)
+    return iv, np.array([transcription_hz(n["pitch"]) for n in notes])
+
+
+def note_f1(ref: list[dict], est: list[dict], offsets: bool = False) -> dict:
     import mir_eval
 
     if not ref:
         return {"precision": None, "recall": None, "f1": None, "n_ref": 0, "n_est": len(est)}
     if not est:
         return {"precision": 0.0, "recall": 0.0, "f1": 0.0, "n_ref": len(ref), "n_est": 0}
-    ri = np.array([[n["start"], n["end"]] for n in ref])
-    rp = np.array([transcription_hz(n["pitch"]) for n in ref])
-    ei = np.array([[n["start"], max(n["end"], n["start"] + 0.01)] for n in est])
-    ep = np.array([transcription_hz(n["pitch"]) for n in est])
-    p, r, f, _ = mir_eval.transcription.precision_recall_f1_overlap(ri, rp, ei, ep, onset_tolerance=0.05,
-                                                                   offset_ratio=None)
+    ri, rp = _arrays(ref)
+    ei, ep = _arrays(est)
+    p, r, f, _ = mir_eval.transcription.precision_recall_f1_overlap(
+        ri, rp, ei, ep, onset_tolerance=0.05, offset_ratio=0.2 if offsets else None)
     return {"precision": round(p, 3), "recall": round(r, 3), "f1": round(f, 3), "n_ref": len(ref), "n_est": len(est)}
 
 
-def transcription_hz(m: int) -> float:
-    return 440.0 * 2 ** ((m - 69) / 12)
+def matched(ref: list[dict], est: list[dict]) -> list[tuple[int, int]]:
+    import mir_eval
+
+    if not ref or not est:
+        return []
+    ri, rp = _arrays(ref)
+    ei, ep = _arrays(est)
+    return mir_eval.transcription.match_notes(ri, rp, ei, ep, onset_tolerance=0.05, offset_ratio=None)
 
 
 def onset_f1(ref: list[float], est: list[float]) -> dict:
@@ -53,100 +73,157 @@ def onset_f1(ref: list[float], est: list[float]) -> dict:
     return {"precision": round(p, 3), "recall": round(r, 3), "f1": round(f, 3), "n_ref": len(ref), "n_est": len(est)}
 
 
-def main() -> None:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--sample", default=str(ROOT.parent / "samples" / "stemforge-demo.flac"))
-    ap.add_argument("--out", default=None)
-    args = ap.parse_args()
-    truth = json.loads(Path(args.sample).with_suffix(".truth.json").read_text(encoding="utf-8"))
-    mix = audio.decode(Path(args.sample), "flac")
+def run_fixture(name: str, mix: np.ndarray, truth: dict) -> dict:
+    sr = audio.TARGET_SR
+    seps: dict[str, DemucsSeparator] = {}
+
+    def separate(model, x, cb):
+        seps.setdefault(model, DemucsSeparator(model))
+        return gate_mixture_silence(x, seps[model].separate(x, sr, cb), sr)
 
     t0 = time.monotonic()
-    ana = analysis.analyze(mix, audio.TARGET_SR)
-    t_ana = time.monotonic() - t0
-    sep = DemucsSeparator("htdemucs")
-    t0 = time.monotonic()
-    stems = sep.separate(mix, audio.TARGET_SR, lambda f: None)
+    base = separate("htdemucs", mix, lambda f: None)
     t_sep = time.monotonic() - t0
-    resid = residual_db(mix, stems)
+    t0 = time.monotonic()
+    d = discover(mix, sr, base, "htdemucs", separate, lambda f, m: None)
+    t_disc = time.monotonic() - t0
 
-    rows = []
-    notes = truth["notes"]
-    # Demucs routes the synthetic lead into "other" (the vocal stem comes out near-silent), so the
-    # "other" stem is scored against keys + lead.
-    targets = [("drums", "drums", notes["drums"]), ("bass", "bass", notes["bass"]),
-               ("keys+lead", "other", notes["keys"] + notes["lead"]), ("lead", "vocals", notes["lead"])]
-    stem_levels = {s: audio.level_stats(v)["rms_db"] for s, v in stems.items()}
-    for part, stem, ref in targets:
-        if stem_levels[stem] < -55:
-            rows.append({"part": part, "stem": stem, "engine": "-", "policy": True, "precision": None,
-                         "recall": None, "f1": None, "n_ref": len(ref), "n_est": 0,
-                         "seconds": 0, "note": f"stem silent ({stem_levels[stem]} dB): skipped"})
-            continue
-        engines = ["drum-nmf"] if stem == "drums" else ["basic-pitch", "pyin"]
-        for eng in engines:
-            # The policy engine gets its policy params; the alternative gets the same frequency band.
-            pol_engine, pol_params, _ = transcription.choose_engine(stem)
-            band = {k: pol_params[k] for k in ("min_freq", "max_freq") if k in pol_params}
-            params = transcription.resolve_params(eng, pol_params if pol_engine == eng else band)
-            t0 = time.monotonic()
-            feats = transcription.compute_features(eng, stems[stem], audio.TARGET_SR, params)
-            est = transcription.notes_from_features(eng, feats, stems[stem], audio.TARGET_SR, params)
-            dt = time.monotonic() - t0
-            policy = transcription.choose_engine(stem)[0] == eng
-            if stem == "drums":
-                for cls, pitch in transcription.GM_DRUMS.items():
-                    m = onset_f1([n["start"] for n in ref if n["pitch"] == pitch],
-                                 [n["start"] for n in est if n["pitch"] == pitch])
-                    rows.append({"part": f"drums/{cls}", "stem": stem, "engine": eng, "policy": policy,
-                                 **m, "seconds": round(dt, 2)})
-            else:
-                m = note_f1(ref, est)
-                conf = [n["confidence"] for n in est]
-                rows.append({"part": part, "stem": stem, "engine": eng, "policy": policy, **m,
-                             "mean_conf": round(float(np.mean(conf)), 3) if conf else None, "seconds": round(dt, 2)})
-
-    result = {
-        "sample": Path(args.sample).name, "duration": round(mix.shape[1] / audio.TARGET_SR, 2),
-        "device": __import__("stemforge.pipeline.separation", fromlist=["x"]).resolve_device(),
-        "tempo_est": ana.get("tempo"), "tempo_true": truth["bpm"], "key_est": (ana.get("key") or {}).get("label"),
-        "key_true": truth["key"], "analysis_seconds": round(t_ana, 2), "separation_seconds": round(t_sep, 2),
-        "mix_residual_db": resid, "stem_rms_db": stem_levels, "rows": rows,
+    families = {s.meta["family"] for s in d.sources.values() if s.status == "accepted"}
+    expect = truth.get("expect", {})
+    discovery = {
+        "sources": {k: f"{s.meta['display']} ({s.status}, {s.meta.get('isolation')})" for k, s in d.sources.items()},
+        "present_ok": {f: f in families for f in expect.get("present", [])},
+        "absent_ok": {f: f not in families for f in expect.get("absent", [])},
+        "reconstruction": d.reconstruction, "tagger": d.tagger,
     }
-    print(json.dumps(result, indent=1))
+
+    raw: dict[str, list[dict]] = {}
+    refined: dict[str, list[dict]] = {}
+    t0 = time.monotonic()
+    for stem, src in d.sources.items():
+        eng, params, _ = transcription.choose_engine(stem)
+        feats = transcription.compute_features(eng, src.audio, sr, params)
+        raw[stem] = transcription.notes_from_features(eng, feats, src.audio, sr, params)
+        refined[stem] = refine.apply(stem, eng, raw[stem], src.audio, sr).notes
+    pitched = [s for s in refined if s not in ("drums", "percussion")]
+    dupes = refine.cross_source_duplicates({s: refined[s] for s in pitched})
+    for s, ids in dupes.items():
+        refined[s] = [n for n in refined[s] if n["id"] not in set(ids)]
+    t_tr = time.monotonic() - t0
+
+    rows: list[dict] = []
+    notes = truth["notes"]
+    pitched_parts = {k: v for k, v in notes.items() if k != "drums"}
+    for part, ref in pitched_parts.items():
+        # Each reference part is scored against the source that transcribes it best.
+        best = max(pitched, key=lambda s: note_f1(ref, refined[s])["f1"] or 0.0) if pitched else None
+        if best is None:
+            rows.append({"part": part, "source": "-", "raw": None, "refined": None})
+            continue
+        row = {"part": part, "source": d.sources[best].meta["display"],
+               "raw": note_f1(ref, raw[best]), "refined": note_f1(ref, refined[best]),
+               "refined_offsets": note_f1(ref, refined[best], offsets=True)}
+        quiet = [n for n in ref if n.get("gain", 1.0) < 0.5]
+        if quiet:
+            row["quiet_recall"] = note_f1(quiet, refined[best])["recall"]
+        pairs = matched(ref, refined[best])
+        gains = [ref[i].get("gain") for i, _ in pairs]
+        if pairs and all(g is not None for g in gains) and len(set(gains)) > 1:
+            vel = np.array([refined[best][j]["velocity"] for _, j in pairs], dtype=float)
+            g = np.array(gains, dtype=float)
+            row["velocity_loud_minus_quiet"] = round(float(vel[g >= 0.5].mean() - vel[g < 0.5].mean()), 1)
+        rows.append(row)
+    all_ref = [n for v in pitched_parts.values() for n in v]
+    union = {"raw": note_f1(all_ref, [n for s in pitched for n in raw[s]]),
+             "refined": note_f1(all_ref, [n for s in pitched for n in refined[s]])} if all_ref else None
+    drums = []
+    if "drums" in notes:
+        est = refined.get("drums", [])
+        for cls, pitch in transcription.GM_DRUMS.items():
+            drums.append({"class": cls, **onset_f1([n["start"] for n in notes["drums"] if n["pitch"] == pitch],
+                                                   [n["start"] for n in est if n["pitch"] == pitch])})
+    return {
+        "fixture": name, "duration": round(mix.shape[1] / sr, 2), "device": resolve_device(),
+        "seconds": {"separation": round(t_sep, 1), "discovery": round(t_disc, 1), "transcription": round(t_tr, 1)},
+        "discovery": discovery, "rows": rows, "union": union, "drums": drums,
+    }
+
+
+def main() -> None:
+    from fixtures import FIXTURES, fixture
+
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--fixtures", nargs="*", default=list(FIXTURES))
+    ap.add_argument("--out", default=None)
+    ap.add_argument("--json", default=None)
+    args = ap.parse_args()
+    results = []
+    for name in args.fixtures:
+        mix, truth = fixture(name)
+        print(f"== {name}", flush=True)
+        results.append(run_fixture(name, mix, truth))
+        print(json.dumps(results[-1], indent=1, default=float), flush=True)
+    if args.json:
+        Path(args.json).write_text(json.dumps(results, indent=1, default=float))
     if args.out:
         out = Path(args.out)
         marker = "<!-- manual:"
         tail = ""
         if out.exists() and marker in (old := out.read_text(encoding="utf-8")):
             tail = "\n" + old[old.index(marker):]
-        out.write_text(render_md(result) + tail, encoding="utf-8")
+        out.write_text(render_md(results) + tail, encoding="utf-8")
 
 
-def render_md(r: dict) -> str:
+def _f(m: dict | None, key: str = "f1") -> str:
+    return "–" if not m or m.get(key) is None else str(m[key])
+
+
+def render_md(results: list[dict]) -> str:
     lines = [
-        "# Evaluation on the bundled demo",
+        "# Evaluation",
         "",
-        "Generated by `backend/scripts/evaluate.py`. The fixture is the synthetic CC0 song in "
-        "`samples/`, whose ground-truth notes are known exactly. These numbers check that the pipeline "
-        "and the engine policy work. They do **not** predict accuracy on real, mastered recordings, "
-        "where separation bleed is much worse.",
+        "Generated by `backend/scripts/evaluate.py` on the CC0 fixtures in `samples/` (`fixtures.py`), whose "
+        "ground truth is exact. The scored path is the production pipeline: HTDemucs, mixture-silence gate, "
+        "source discovery, policy engine, note refinement and cross-source attribution. **Raw** is the "
+        "engine output; **refined** is what the app shows. The fixtures are synthetic: they check behaviour "
+        "(absence, quiet and repeated notes, silence, reverb, chunk boundaries) and do not predict accuracy "
+        "on commercial recordings.",
         "",
-        f"* Duration: {r['duration']} s. Device: **{r['device']}**.",
-        f"* Separation (htdemucs) took {r['separation_seconds']} s. Mix residual |mix - Σstems| is {r['mix_residual_db']} dB.",
-        f"* Tempo estimated {r['tempo_est']} BPM (true {r['tempo_true']}). Key estimated {r['key_est']} (true {r['key_true']}).",
+        "## Discovery",
         "",
-        "| Part | Stem | Engine | Policy pick | Precision | Recall | F1 | Ref | Est | Time (s) |",
-        "|---|---|---|---|---|---|---|---|---|---|",
+        "| Fixture | Duration | Sources found | Expected present | Expected absent | Mix rebuilt to | Time sep / disc / transcr (s) |",
+        "|---|---|---|---|---|---|---|",
     ]
-    for row in r["rows"]:
-        lines.append(
-            f"| {row['part']} | {row['stem']} | {row['engine']} | {'yes' if row['policy'] else ''} | "
-            f"{row.get('precision')} | {row.get('recall')} | **{row.get('f1')}** | {row.get('n_ref')} | "
-            f"{row.get('n_est')} | {row.get('seconds')} |" + (f" {row['note']}" if row.get("note") else "")
-        )
-    lines += ["", "Metric: mir_eval note onset F1 (50 ms tolerance, pitch within 50 cents, offsets ignored). "
-              "For drums: onset F1 per GM class."]
+    for r in results:
+        d = r["discovery"]
+        ok = lambda m: ", ".join(f"{k} {'✓' if v else '✗'}" for k, v in m.items()) or "–"  # noqa: E731
+        lines.append(f"| {r['fixture']} | {r['duration']} s | {'; '.join(d['sources'].values())} | {ok(d['present_ok'])} | "
+                     f"{ok(d['absent_ok'])} | {d['reconstruction']['residual_db']} dB | "
+                     f"{r['seconds']['separation']} / {r['seconds']['discovery']} / {r['seconds']['transcription']} |")
+    lines += ["", "## Pitched transcription (note onset F1)", "",
+              "| Fixture | Part | Best source | Raw P / R / F1 | Refined P / R / F1 | Refined onset+offset F1 | Quiet-note recall | Velocity loud − quiet |",
+              "|---|---|---|---|---|---|---|---|"]
+    for r in results:
+        for row in r["rows"]:
+            raw, ref = row.get("raw"), row.get("refined")
+            lines.append(
+                f"| {r['fixture']} | {row['part']} | {row['source']} | {_f(raw, 'precision')} / {_f(raw, 'recall')} / **{_f(raw)}** | "
+                f"{_f(ref, 'precision')} / {_f(ref, 'recall')} / **{_f(ref)}** | {_f(row.get('refined_offsets'))} | "
+                f"{row.get('quiet_recall', '–')} | {row.get('velocity_loud_minus_quiet', '–')} |")
+        if r.get("union"):
+            u = r["union"]
+            lines.append(f"| {r['fixture']} | *all pitched parts* | *all pitched sources* | {_f(u['raw'], 'precision')} / "
+                         f"{_f(u['raw'], 'recall')} / **{_f(u['raw'])}** | {_f(u['refined'], 'precision')} / "
+                         f"{_f(u['refined'], 'recall')} / **{_f(u['refined'])}** | | | |")
+    lines += ["", "## Drums (onset F1 per GM class)", "", "| Fixture | Class | Precision | Recall | F1 | Ref | Est |",
+              "|---|---|---|---|---|---|---|"]
+    for r in results:
+        for row in r["drums"]:
+            lines.append(f"| {r['fixture']} | {row['class']} | {_f(row, 'precision')} | {_f(row, 'recall')} | "
+                         f"**{_f(row)}** | {row.get('n_ref', '–')} | {row.get('n_est', '–')} |")
+    lines += ["", f"Device: {results[0]['device'] if results else '–'}. Velocity column: mean MIDI velocity of matched "
+              "loud notes minus quiet notes (the keys fixture's quiet bars are ~16 dB down); positive means the "
+              "dynamics survived."]
     return "\n".join(lines) + "\n"
 
 

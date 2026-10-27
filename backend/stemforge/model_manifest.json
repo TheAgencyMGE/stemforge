@@ -1,13 +1,27 @@
 {
-  "_comment": "Pinned model weights. URLs are fixed to a Hugging Face commit and every file is SHA-256 verified (hashes are the LFS object ids published by the Hub API). Only safetensors are accepted: no pickled checkpoints are ever loaded.",
+  "_comment": "Pinned model weights. Hugging Face entries are fixed to a commit and every file is SHA-256 verified (hashes are the LFS object ids published by the Hub API). Runtime loading reads safetensors only. The PANNs entry is published as a PyTorch checkpoint on Zenodo: its MD5 (published by Zenodo) and SHA-256 are verified, it is opened once with torch's restricted weights_only unpickler, converted to safetensors, and the converted file is pinned too.",
   "models": {
     "htdemucs": {
       "repo": "adefossez/HTDemucs",
       "revision": "cbc8a9b1a87023b7fd74e7b3412e6321c0eab003",
-      "sources": ["drums", "bass", "other", "vocals"],
-      "bag": {"models": ["955717e8"], "weights": null},
+      "sources": [
+        "drums",
+        "bass",
+        "other",
+        "vocals"
+      ],
+      "bag": {
+        "models": [
+          "955717e8"
+        ],
+        "weights": null
+      },
       "files": [
-        {"name": "955717e8.safetensors", "sha256": "d9fa14133cfcc034a6758923bb3a8ca9f8dfd0b582134643bbf83f72c17576dd", "size": 84025440}
+        {
+          "name": "955717e8.safetensors",
+          "sha256": "d9fa14133cfcc034a6758923bb3a8ca9f8dfd0b582134643bbf83f72c17576dd",
+          "size": 84025440
+        }
       ],
       "license": "Code MIT (adefossez/demucs). The weights repository states no separate license; verify before commercial use.",
       "default": true
@@ -15,10 +29,26 @@
     "htdemucs_6s": {
       "repo": "adefossez/HTDemucs-6s",
       "revision": "3c5ee475be622df764938de97e4281a7b07ffa58",
-      "sources": ["drums", "bass", "other", "vocals", "guitar", "piano"],
-      "bag": {"models": ["5c90dfd2"], "weights": null},
+      "sources": [
+        "drums",
+        "bass",
+        "other",
+        "vocals",
+        "guitar",
+        "piano"
+      ],
+      "bag": {
+        "models": [
+          "5c90dfd2"
+        ],
+        "weights": null
+      },
       "files": [
-        {"name": "5c90dfd2.safetensors", "sha256": "d2a1745f0744721f6b8ca5bf469b67c651ea5ed1b52998cab033b2158609d411", "size": 54885744}
+        {
+          "name": "5c90dfd2.safetensors",
+          "sha256": "d2a1745f0744721f6b8ca5bf469b67c651ea5ed1b52998cab033b2158609d411",
+          "size": 54885744
+        }
       ],
       "license": "Code MIT (adefossez/demucs). The weights repository states no separate license; verify before commercial use.",
       "caveat": "Upstream: the piano source has a lot of bleeding and artifacts; guitar quality is okay.",
@@ -27,19 +57,92 @@
     "htdemucs_ft": {
       "repo": "adefossez/HTDemucs-ft",
       "revision": "d74ac89c3a1e874fc78f152555cf4d8533f06cd4",
-      "sources": ["drums", "bass", "other", "vocals"],
+      "sources": [
+        "drums",
+        "bass",
+        "other",
+        "vocals"
+      ],
       "bag": {
-        "models": ["f7e0c4bc", "d12395a8", "92cfc3b6", "04573f0d"],
-        "weights": [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]]
+        "models": [
+          "f7e0c4bc",
+          "d12395a8",
+          "92cfc3b6",
+          "04573f0d"
+        ],
+        "weights": [
+          [
+            1,
+            0,
+            0,
+            0
+          ],
+          [
+            0,
+            1,
+            0,
+            0
+          ],
+          [
+            0,
+            0,
+            1,
+            0
+          ],
+          [
+            0,
+            0,
+            0,
+            1
+          ]
+        ]
       },
       "files": [
-        {"name": "f7e0c4bc.safetensors", "sha256": "2c85ab3c62dd6edd8e0b965e38b16fd1cdde357cc25de6b6bc9ce7c83f60925f", "size": 84025440},
-        {"name": "d12395a8.safetensors", "sha256": "5b01a97567ae9a3178a6236fb520251045c03eb8834bc8c24a4eec11d6c8fb56", "size": 84025440},
-        {"name": "92cfc3b6.safetensors", "sha256": "a241863551f30d01c42bd7b97da40839922ead3acb0f1fcab25682f55b4eeb59", "size": 84025440},
-        {"name": "04573f0d.safetensors", "sha256": "68854b0d7c2b3274723b5761f6fd9f5aec5f1bcd3f0de7c1669546fdb7871b7c", "size": 84025440}
+        {
+          "name": "f7e0c4bc.safetensors",
+          "sha256": "2c85ab3c62dd6edd8e0b965e38b16fd1cdde357cc25de6b6bc9ce7c83f60925f",
+          "size": 84025440
+        },
+        {
+          "name": "d12395a8.safetensors",
+          "sha256": "5b01a97567ae9a3178a6236fb520251045c03eb8834bc8c24a4eec11d6c8fb56",
+          "size": 84025440
+        },
+        {
+          "name": "92cfc3b6.safetensors",
+          "sha256": "a241863551f30d01c42bd7b97da40839922ead3acb0f1fcab25682f55b4eeb59",
+          "size": 84025440
+        },
+        {
+          "name": "04573f0d.safetensors",
+          "sha256": "68854b0d7c2b3274723b5761f6fd9f5aec5f1bcd3f0de7c1669546fdb7871b7c",
+          "size": 84025440
+        }
       ],
       "license": "Code MIT (adefossez/demucs). The weights repository states no separate license; verify before commercial use.",
       "default": false
+    },
+    "panns_cnn14_16k": {
+      "dir": "tagger",
+      "url": "https://zenodo.org/records/3987831/files/Cnn14_16k_mAP%3D0.438.pth?download=1",
+      "source_file": {
+        "name": "Cnn14_16k_mAP=0.438.pth",
+        "size": 358668570,
+        "md5": "362fc5ff18f1d6ad2f6d464b45893f2c",
+        "sha256": "e2ee543a27919542c2ea03eabaa70b24dcd4e6c8e05621de6b67a94e4c5058e6"
+      },
+      "convert": "panns_cnn14",
+      "sources": [],
+      "files": [
+        {
+          "name": "cnn14_16k.safetensors",
+          "sha256": "4d01c6676d909030ffb4c93d6ad5877ecd62c686a09b81b9eee13b1dd8d4566d",
+          "size": 323152628
+        }
+      ],
+      "license": "Code MIT (qiuqiangkong/audioset_tagging_cnn). Weights CC BY 4.0 (Zenodo record 3987831, Kong et al. 2020): attribution required. AudioSet labels by Google, CC BY 4.0.",
+      "purpose": "Instrument and voice tagging (AudioSet classes) for source discovery. Does not separate audio.",
+      "default": true
     }
   }
 }

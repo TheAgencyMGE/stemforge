@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from pathlib import Path
 
 
 def api(argv: list[str] | None = None) -> None:
@@ -32,6 +33,8 @@ def models(argv: list[str] | None = None) -> None:
     sub = parser.add_subparsers(dest="cmd", required=True)
     d = sub.add_parser("download")
     d.add_argument("names", nargs="*", help="models to fetch (default: all default models)")
+    d.add_argument("--source-file", default=None,
+                   help="use an already downloaded upstream file (one model only); it is verified like a download")
     sub.add_parser("verify")
     sub.add_parser("list")
     args = parser.parse_args(argv)
@@ -41,7 +44,7 @@ def models(argv: list[str] | None = None) -> None:
         for name, spec in reg.manifest().items():
             st = reg.status(name)
             print(f"{name:14s} {'installed' if st['installed'] else 'missing  '} {st['size_bytes'] / 1e6:7.1f} MB  "
-                  f"stems={','.join(spec['sources'])}")
+                  f"{'stems=' + ','.join(spec['sources']) if spec['sources'] else spec.get('purpose', '')}")
             print(f"{'':14s} license: {spec['license']}")
         return
     if args.cmd == "verify":
@@ -55,8 +58,10 @@ def models(argv: list[str] | None = None) -> None:
                 failed = failed or reg.manifest()[name].get("default", False)
         sys.exit(1 if failed else 0)
     names = args.names or [n for n, s in reg.manifest().items() if s.get("default")]
+    if args.source_file and len(names) != 1:
+        parser.error("--source-file needs exactly one model name")
     for name in names:
-        reg.download(name)
+        reg.download(name, source_file=Path(args.source_file) if args.source_file else None)
         reg.verify(name)
         print(f"{name}: installed and verified")
 

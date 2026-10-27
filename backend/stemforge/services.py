@@ -16,17 +16,17 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from . import __version__
+from . import __version__, exports
 from .config import get_settings
 from .models import Artifact, Job, Project, Track, utcnow
-from .pipeline import midi
+from .pipeline import midi, transcription
 from .pipeline.runner import RETRANSCRIBE_STAGES, STAGES, _slug
 from .schemas import ArtifactOut, JobOut, ProjectDetail, ProjectSummary, TrackOut
 from .security import sign
 from .storage import get_storage, sha256_file
 
 log = logging.getLogger(__name__)
-PUBLIC_KINDS = {"master", "preview", "stem", "peaks", "spectrogram", "midi", "midi_combined"}
+PUBLIC_KINDS = {"master", "preview", "stem", "peaks", "spectrogram", "midi", "midi_combined", "residual", "midi_render"}
 
 
 def signed_url(art: Artifact, download: bool = False) -> str:
@@ -66,7 +66,7 @@ def track_out(t: Track) -> TrackOut:
         warnings=t.warnings or [], engine=t.engine, engine_reason=t.engine_reason,
         engine_params=t.engine_params or {}, notes_version=t.notes_version, note_count=len(t.notes or []),
         edited=(t.notes or []) != (t.generated_notes or []), transcription_status=t.transcription_status,
-        transcription_summary=summary,
+        transcription_summary=summary, allowed_engines=transcription.allowed_engines(t.stem, t.is_drum),
     )
 
 
@@ -92,7 +92,7 @@ def project_detail(db: Session, p: Project) -> ProjectDetail:
     job = latest_job(db, p.id)
     arts = [
         ArtifactOut(id=a.id, kind=a.kind, stem=a.stem, filename=a.filename, content_type=a.content_type,
-                    size=a.size, url=signed_url(a, download=a.kind in {"stem", "midi", "midi_combined"}),
+                    size=a.size, url=signed_url(a, download=a.kind in {"stem", "midi", "midi_combined", "residual"}),
                     meta=a.meta or {})
         for a in p.artifacts if a.kind in PUBLIC_KINDS
     ]
@@ -108,12 +108,18 @@ def project_detail(db: Session, p: Project) -> ProjectDetail:
 # ------------------------------------------------------------------ MIDI export from current edits
 
 
-def build_export_midi(p: Project, tracks: list[Track], out: Path) -> dict:
-    bpm = p.tempo_bpm or (p.analysis or {}).get("tempo") or 120.0
+def build_export_midi(p: Project, tracks: list[Track], out: Path, bpm: float | None = None,
+                      tempo_map: bool = False) -> dict:
+    """``bpm`` overrides the project tempo. Note times are seconds, so any tempo keeps them exact;
+    it only changes where bar lines fall (Soundtrap needs a tempo the user can type). ``tempo_map``
+    writes a tempo change on every detected beat instead, for DAWs that follow tempo maps."""
+    tempo = float(bpm or p.tempo_bpm or (p.analysis or {}).get("tempo") or 120.0)
+    beats = [float(b) + float(p.offset_seconds or 0.0) for b in (p.analysis or {}).get("beats") or []]
+    tmap = midi.TimeMap(tempo, beats if tempo_map else None)
     specs = [midi.MidiTrackSpec(t.display_name, t.notes or [], t.gm_program, t.is_drum) for t in tracks]
     sections = (p.analysis or {}).get("sections") if len(tracks) > 1 else None
-    mf = midi.build_midi(specs, bpm, p.time_signature, p.offset_seconds, (p.analysis or {}).get("key"), sections)
-    return midi.save_and_validate(mf, out, specs, bpm, p.offset_seconds)
+    mf = midi.build_midi(specs, tmap, p.time_signature, p.offset_seconds, (p.analysis or {}).get("key"), sections)
+    return midi.save_and_validate(mf, out, specs, tmap, p.offset_seconds)
 
 
 def select_tracks(p: Project, stems: str | None) -> list[Track]:
@@ -131,34 +137,54 @@ ATTRIBUTION = """Generated with Stemforge.
 Source separation: Demucs / HTDemucs (MIT, https://github.com/adefossez/demucs). Weights from
 adefossez/HTDemucs* on Hugging Face; no separate weight license is stated - verify before commercial use.
 Transcription: Spotify Basic Pitch (Apache-2.0), librosa pYIN (ISC), Stemforge drum DSP.
+Instrument identification: PANNs Cnn14 by Qiuqiang Kong et al. (code MIT; weights CC BY 4.0,
+https://zenodo.org/records/3987831), AudioSet class names by Google (CC BY 4.0).
+A stem is a model's estimate of one source, not the original multitrack. See export_manifest.json.
 You are responsible for having the rights to the source recording.
 """
 
 
 def write_bundle(db: Session, p: Project, out: Path, tracks: list[Track], include_stems: bool, include_midi: bool,
-                 full_project: bool) -> None:
+                 full_project: bool, mode: exports.Mode = "synced", mix_tracks: list[Track] | None = None,
+                 tempo_map: bool = False) -> None:
+    """Zip export. ``tracks`` are the exported sources; ``mix_tracks`` (if given) are summed into a
+    rendered mix, which is how muted lanes are left out of a mix without touching their stems."""
     storage = get_storage()
     with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED, allowZip64=True) as z:
         z.writestr("ATTRIBUTION.txt", ATTRIBUTION)
-        stems = {t.stem for t in tracks}
-        if include_stems:
-            for a in p.artifacts:
-                if a.kind == "stem" and a.stem in stems:
-                    with storage.open(a.storage_key) as f:
-                        z.writestr(f"stems/{a.filename}", f.read(), compress_type=zipfile.ZIP_STORED)
+        manifest = exports.manifest_header(p, mode)
+        if include_stems or mix_tracks:
+            with tempfile.TemporaryDirectory() as td:
+                if include_stems:
+                    for t in tracks:
+                        path, entry = exports.export_track_audio(storage, p, t, mode, Path(td))
+                        if path is None:
+                            manifest["excluded"].append(entry)
+                            continue
+                        z.write(path, f"stems/{path.name}", compress_type=zipfile.ZIP_STORED)
+                        manifest["files"].append(entry)
+                if mix_tracks:
+                    mix_path = Path(td) / f"{_slug(p.name)}-mix.flac"
+                    manifest["mix"] = exports.render_mix(storage, p, mix_tracks, mix_path)
+                    z.write(mix_path, f"mix/{mix_path.name}", compress_type=zipfile.ZIP_STORED)
         if include_midi:
             with tempfile.TemporaryDirectory() as td:
                 for t in tracks:
                     if t.transcription_status != "done":
                         continue
                     path = Path(td) / f"{t.stem}.mid"
-                    build_export_midi(p, [t], path)
+                    build_export_midi(p, [t], path, tempo_map=tempo_map)
                     z.write(path, f"midi/{_slug(p.name)}-{t.stem}.mid")
+                    manifest["midi"].append({"file": f"midi/{_slug(p.name)}-{t.stem}.mid", "track": t.display_name,
+                                             "timeline": "original file (offset applied)",
+                                             "timing": "unquantized model timing plus user edits"})
                 done = [t for t in tracks if t.transcription_status == "done"]
                 if done:
                     path = Path(td) / "multitrack.mid"
-                    build_export_midi(p, done, path)
+                    build_export_midi(p, done, path, tempo_map=tempo_map)
                     z.write(path, "multitrack.mid")
+        if not full_project:
+            z.writestr("export_manifest.json", json.dumps(manifest, indent=2, default=float))
         if full_project:
             doc = {
                 "bundle_version": BUNDLE_VERSION, "app_version": __version__,
@@ -177,7 +203,8 @@ def write_bundle(db: Session, p: Project, out: Path, tracks: list[Track], includ
                 "artifacts": [],
             }
             for a in p.artifacts:
-                if a.kind in {"master", "preview", "stem", "peaks", "spectrogram", "features"}:
+                if a.kind in {"master", "preview", "stem", "peaks", "spectrogram", "features", "residual",
+                              "discovery"}:
                     name = f"artifacts/{a.kind}-{a.stem or 'mix'}{Path(a.storage_key).suffix}"
                     with storage.open(a.storage_key) as f:
                         z.writestr(name, f.read())
@@ -240,12 +267,18 @@ def import_bundle(db: Session, zip_path: Path) -> Project:
                 if a.get("sha256") and sha256_file(local) != a["sha256"]:
                     raise BundleError(f"checksum mismatch for {path}")
                 kind, stem = str(a["kind"]), a.get("stem")
-                if kind not in {"master", "preview", "stem", "peaks", "spectrogram", "features"}:
+                if kind not in {"master", "preview", "stem", "peaks", "spectrogram", "features", "residual",
+                                "discovery"}:
                     raise BundleError("bad artifact kind")
                 sub = {"master": "", "preview": "preview/", "stem": "stems/", "peaks": "peaks/",
-                       "spectrogram": "spectrogram/", "features": "features/"}[kind]
+                       "spectrogram": "spectrogram/", "features": "features/", "residual": "stems/",
+                       "discovery": ""}[kind]
                 fname = re.sub(r"[^A-Za-z0-9_\-.]", "_", str(a.get("filename") or local.name))[:120]
                 key = f"projects/{p.id}/{sub}{'master.flac' if kind == 'master' else (stem or 'mix') + local.suffix}"
+                if kind == "residual":
+                    key = f"projects/{p.id}/stems/internal_residual.flac"
+                elif kind == "discovery":
+                    key = f"projects/{p.id}/discovery.json"
                 if kind == "features":
                     key = f"projects/{p.id}/features/{stem}-{(a.get('meta') or {}).get('engine', 'x')}.npz"
                 size = storage.put_file(key, local, str(a.get("content_type", "application/octet-stream")))

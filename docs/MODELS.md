@@ -12,6 +12,9 @@ Checked against upstream pages in October 2026. Licenses below are what those pa
 | HTDemucs `htdemucs_6s` | Adds guitar and piano. Upstream calls guitar okay and piano full of bleed. The 6-stem model was not trained on MUSDB; the author said the data is Meta's and declined a commercial answer ([demucs#418](https://github.com/facebookresearch/demucs/issues/418)). | Does not split acoustic/electric guitar, lead/rhythm, or keyboards other than piano. | Same code license. Weight license not stated. Optional at upload. |
 | Basic Pitch 0.4 (ONNX) | Polyphonic, instrument-agnostic note transcription with pitch bends. The library already slices audio into windows of `AUDIO_N_SAMPLES` with 30 frames of overlap and stitches the activations. | Not an instrument classifier. One mix in, one set of notes out. Works best on one instrument at a time, per the project README. | Apache-2.0. Model files ship in the package. No separate weight license is stated. |
 | librosa pYIN | Monophonic f0, voiced probability, and pitch bend from the contour. | Not polyphonic. | ISC. No learned weights. |
+| PANNs Cnn14 16 kHz (`panns_cnn14_16k`) | AudioSet tagging of the mix and of every candidate source: evidence for which instruments are present and what each source is. About 90 of its 527 classes are instruments or voice types (mapped in `discovery.AUDIOSET`). | Does not separate. Clip-level labels: families are reliable, close members (sax types, lead vs rhythm) are not. | Code MIT; weights CC BY 4.0 (Zenodo 3987831). Attribution in THIRD_PARTY_NOTICES and in every export. |
+| `htdemucs_6s` as a guide | When tags indicate guitar or piano in the residual, its guitar/piano/other outputs become ratio masks over the 4-stem residual. A target is kept only if its own tags confirm it. | Not run when there is no evidence. Not a guitar or piano model of its own. | As above. |
+| HPSS (librosa) | Percussive mask of the residual when tags indicate tambourine, shaker, wood block, gong and similar. Kept only if its tags confirm percussion and the residual loses that evidence. | Also carries note attacks of pitched instruments. | ISC. No learned weights. |
 | Drum NMF in this repo | Three spectral templates (kick, snare, hi-hat), after Dittmar & Gärtner, DAFx 2014. Implemented in NumPy. | Not a neural drum transcriber. | MIT (this repo). Fixed templates, no checkpoint. |
 
 Demucs chunk boundaries are crossfaded in `overlap_add`. A chunk that touches the start or end of the file is not faded on that edge, so samples are not shifted. Basic Pitch's own window stitch is left to that library.
@@ -64,7 +67,16 @@ Pitch ranges on those rows are review bounds. Notes outside them are flagged and
 | madmom | Beat and downbeat models | Model license CC BY-NC-SA. Meter in Stemforge is an accent estimate on librosa beats. It stays undecided when accents are flat or when two meters are nearly tied (the bundled demo's even backbeat is one of those ties). It does not change the project's time signature. |
 | Band Transcriber | A pipeline sketch (Demucs, Basic Pitch, MT3) | No stated license. No code was copied. |
 
+## Source discovery and the registry
+
+Registry rows added for discovery (rap and spoken voice, drum machine, timpani, tabla, wood block, gong, bells, auxiliary percussion, steel guitar, sitar, zither, synthesizer, sampler, steelpan, brass and woodwind sections, saxophone, didgeridoo, theremin, singing bowl, turntable, orchestra) exist because the tagger can *identify* them. None has its own separator: a row's `separate` field still says what the bundled models can isolate. A source is named after one of them only when it is what a residual holds. See ARCHITECTURE.md, "Source discovery".
+
 ## MIDI review
+
+Two refinements change the notes the app shows, each gated by audio evidence and measured in EVALUATION.md; the raw model notes are stored per track (`notes_raw` artifact):
+
+* **Split-sustain merge** (Basic Pitch sources): a note is joined to the same-pitch note before it only if the gap is under 30 ms *and* the constant-Q energy at that pitch does not rise at the second onset (ratio < 1.2). A re-struck note always rises, so repeated notes stay separate.
+* **Cross-source bleed attribution:** a note that another pitched source has at the same pitch and onset at least 1.5× louder is the bleed copy and is removed from the quieter source (unedited tracks only; user-drawn notes are never touched).
 
 Review suggestions (octave leaps, pitch-range, duplicates, splintered notes, long weak sustains, dense onsets, engine disagreement) do not delete notes. A bass octave correction runs only when the subharmonic is the stronger spectral peak. The previous pitch is stored on the note and can be restored in the editor. Quantize remains an undoable edit. The generated timing is not quantized.
 
